@@ -1,0 +1,32 @@
+# Whitelist: everything is ignored except the port's own files. Never commit game data, the disc or ISO, code
+# recompiled from the game (legobatman/generated/), shader dumps (work/) or build output.
+/*
+!/.gitignore
+!/README.md
+!/PORTING_NOTES.md
+!/patches/
+!/legobatman/
+!/tools/
+
+/tools/*
+!/tools/setup.sh
+!/tools/scripts/
+!/tools/switch-env/
+!/tools/shader-extract/
+/tools/shader-extract/*
+!/tools/shader-extract/*.c
+!/tools/shader-extract/*.cpp
+!/tools/shader-extract/build.sh
+/tools/switch-env/*.log
+/tools/switch-env/switch_host.txt
+
+/legobatman/out/
+/legobatman/userdata*/
+/legobatman/*.log
+/legobatman/nvw.txt
+/legobatman/rbw.txt
+/legobatman/generated/*
+!/legobatman/generated/rexglue.cmake
+
+__pycache__/
+*.pyc

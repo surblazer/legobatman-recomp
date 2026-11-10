@@ -1,0 +1,2405 @@
+diff --git a/sdk/include/rex/thread/mutex.h b/sdk/include/rex/thread/mutex.h
+index 6e5755a..9aa70b4 100644
+--- a/sdk/include/rex/thread/mutex.h
++++ b/sdk/include/rex/thread/mutex.h
+@@ -13,8 +13,35 @@
+ 
+ #include <mutex>
+ 
++#include "rex/platform.h"
++
+ namespace rex::thread {
+ 
++// Acquires a recursive mutex, spinning briefly in user space before blocking (LEGO Batman port).
++// On Horizon a contended mutex is handed over through the kernel (svcArbitrateLock) and the next owner must be
++// scheduled first; LEGO Batman's loader hammers NtSetEvent/NtClearEvent/NtReleaseSemaphore, which all take the
++// global critical region, and profiling showed game and GPU threads blocked there most of the time with the CPU
++// mostly idle. Holds are short, so a bounded spin on try_lock (a user-space CAS in libnx) usually wins the lock
++// without a kernel round trip. Other platforms keep a plain lock().
++// Locks m, spinning on try_lock first on Switch (see above). For code that pairs lock()/unlock() by hand.
++inline void LockAdaptive(std::recursive_mutex& m) {
++#if REX_PLATFORM_SWITCH
++  constexpr int kSpins = 4000;  // ~tens of microseconds on an A57
++  for (int i = 0; i < kSpins; ++i) {
++    if (m.try_lock()) {
++      return;
++    }
++    __asm__ __volatile__("yield");
++  }
++#endif
++  m.lock();
++}
++
++inline std::unique_lock<std::recursive_mutex> AcquireAdaptive(std::recursive_mutex& m) {
++  LockAdaptive(m);
++  return std::unique_lock<std::recursive_mutex>(m, std::adopt_lock);
++}
++
+ // The global critical region mutex singleton.
+ // This must guard any operation that may suspend threads or be sensitive to
+ // being suspended such as global table locks and such.
+@@ -62,12 +89,12 @@ class global_critical_region {
+   // to keep an instance of global_critical_region near the members requiring
+   // it to keep things readable.
+   static std::unique_lock<std::recursive_mutex> AcquireDirect() {
+-    return std::unique_lock<std::recursive_mutex>(mutex());
++    return AcquireAdaptive(mutex());
+   }
+ 
+   // Acquires a lock on the global critical section.
+   inline std::unique_lock<std::recursive_mutex> Acquire() {
+-    return std::unique_lock<std::recursive_mutex>(mutex());
++    return AcquireAdaptive(mutex());
+   }
+ 
+   // Acquires a deferred lock on the global critical section.
+diff --git a/sdk/src/audio/audio_system.cpp b/sdk/src/audio/audio_system.cpp
+index eefee0e..9a11451 100644
+--- a/sdk/src/audio/audio_system.cpp
++++ b/sdk/src/audio/audio_system.cpp
+@@ -29,9 +29,9 @@ REXCVAR_DEFINE_INT32(
+     audio_maxqframes, 8, "Audio",
+     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
+ REXCVAR_DEFINE_BOOL(audio_diag_prioridad_critica, false, "Audio",
+-                    "Diagnostico (solo PC): Audio Worker y XMA Decoder a prioridad de tiempo critico, "
+-                    "como en la Switch, donde van por encima de los hilos del juego y no ceden el "
+-                    "nucleo mientras tienen trabajo");
++                    "Diagnostic (PC only): Audio Worker and XMA Decoder at time-critical priority, "
++                    "as on the Switch, where they run above the game threads and do not yield the "
++                    "core while they have work");
+ 
+ // As with normal Microsoft, there are like twelve different ways to access
+ // the audio APIs. Early games use XMA*() methods almost exclusively to touch
+diff --git a/sdk/src/audio/sdl/sdl_audio_driver.cpp b/sdk/src/audio/sdl/sdl_audio_driver.cpp
+index 9a5ec12..d4acd14 100644
+--- a/sdk/src/audio/sdl/sdl_audio_driver.cpp
++++ b/sdk/src/audio/sdl/sdl_audio_driver.cpp
+@@ -31,17 +31,17 @@
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+ REXCVAR_DEFINE_INT32(audio_sdl_rafaga_tramas, 0, "Audio",
+-                     "Diagnostico: el driver SDL saca las tramas del juego de N en N, con N "
+-                     "liberaciones seguidas, como el driver de la Switch con buferes de 4 tramas; "
+-                     "0 o 1 = una a una, como siempre");
++                     "Diagnostic: the SDL driver takes the game's frames N at a time, with N "
++                     "releases in a row, like the Switch driver with 4-frame buffers; "
++                     "0 or 1 = one by one, as always");
+ REXCVAR_DEFINE_BOOL(audio_sdl_bomba, false, "Audio",
+-                    "Diagnostico: un hilo pide una trama del juego cada 5,333 ms (como la bomba del "
+-                    "driver de la Switch) y SDL deja de liberar el semaforo al consumir");
++                    "Diagnostic: a thread requests a game frame every 5.333 ms (like the Switch "
++                    "driver's pump) and SDL stops releasing the semaphore on consume");
+ REXCVAR_DEFINE_INT32(audio_volcado_salida_s, 0, "Audio",
+-                     "Diagnostico: segundos de lo que el driver SDL entrega al dispositivo (con los "
+-                     "silencios por falta de tramas) que se guardan en audio_salida.wav; 0 = nada");
++                     "Diagnostic: seconds of what the SDL driver hands the device (with the "
++                     "silences from missing frames) saved to audio_salida.wav; 0 = none");
+ REXCVAR_DEFINE_INT32(audio_volcado_salida_desde_s, 0, "Audio",
+-                     "Diagnostico: segundos de salida SDL que se saltan antes del volcado");
++                     "Diagnostic: seconds of SDL output skipped before the dump");
+ 
+ namespace rex::audio::sdl {
+ 
+@@ -93,7 +93,7 @@ void GrabarSalida(const float* datos, int bytes, uint32_t canales) {
+     fichero.write("data", 4);
+     u32(bytes_datos);
+     fichero.write(reinterpret_cast<const char*>(volcado_salida.muestras.data()), bytes_datos);
+-    REXAPU_INFO("[audio] volcado de la salida SDL: {} muestras por canal, {} canales, en {}",
++    REXAPU_INFO("[audio] SDL output dump: {} samples per channel, {} channels, in {}",
+                 volcado_salida.muestras.size() / canales, canales, ruta.string());
+   }
+   volcado_salida.muestras = std::vector<float>();
+@@ -106,7 +106,7 @@ void ContarTrama(bool silencio) {
+     return;
+   }
+   if (ultimo_informe_salida.time_since_epoch().count() != 0) {
+-    REXAPU_INFO("[audio] SDL en 10 s: {} tramas con datos y {} de silencio por falta de tramas",
++    REXAPU_INFO("[audio] SDL in 10 s: {} frames with data and {} of silence from missing frames",
+                 tramas_con_datos, tramas_de_silencio);
+   }
+   tramas_con_datos = 0;
+@@ -201,7 +201,7 @@ bool SDLAudioDriver::Initialize() {
+   if (REXCVAR_GET(audio_sdl_bomba)) {
+     bomba_activa_ = true;
+     bomba_ = std::thread([this]() { Bomba(); });
+-    REXAPU_INFO("audio: bomba de diagnostico a 187,5 Hz activa");
++    REXAPU_INFO("audio: 187.5 Hz diagnostic pump on");
+   }
+ 
+   return true;
+diff --git a/sdk/src/audio/switch/switch_audio_system.cpp b/sdk/src/audio/switch/switch_audio_system.cpp
+index 6a9dc8d..2e87501 100644
+--- a/sdk/src/audio/switch/switch_audio_system.cpp
++++ b/sdk/src/audio/switch/switch_audio_system.cpp
+@@ -29,15 +29,15 @@ extern "C" void RexSwitchPerfMax(unsigned id, u64 value);
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+ REXCVAR_DEFINE_BOOL(audio_switch_bomba, true, "Audio",
+-                    "Pedir al juego una trama cada 5,333 ms (bomba de 187,5 Hz, como "
+-                    "MarathonRecomp-NX) en vez de 4 seguidas al consumir cada bufer de audout, que "
+-                    "dejaban sin paquete a la voz del servidor de audio del juego (audio robotico); "
+-                    "se lee al abrir el audio");
++                    "Request a frame from the game every 5.333 ms (a 187.5 Hz pump, like "
++                    "MarathonRecomp-NX) instead of 4 in a row when each audout buffer is consumed, which "
++                    "left the game's audio server voice without a packet (robotic audio); "
++                    "read when audio opens");
+ REXCVAR_DEFINE_INT32(audio_switch_tramas_en_cola, 10, "Audio",
+-                     "Con audio_switch_bomba: tramas del juego que se mantienen en cola antes de audout "
+-                     "(colchon; 10 = 53 ms, 6 hasta la build 105). Mas cola deja esperar al juego sin cortar la "
+-                     "salida, a cambio de latencia: nfsmw_audio_esperar_servidor_ms espera hasta 30 ms; se lee "
+-                     "al abrir el audio");
++                     "With audio_switch_bomba: game frames kept queued before audout "
++                     "(a cushion; 10 = 53 ms, 6 up to build 105). A longer queue lets the game wait without cutting the "
++                     "output, at the cost of latency: nfsmw_audio_esperar_servidor_ms waits up to 30 ms; read "
++                     "when audio opens");
+ 
+ namespace rex::audio::nx {
+ 
+@@ -203,7 +203,7 @@ bool SwitchAudioSystem::StartOutput() {
+   auto output = std::make_unique<Output>();
+   output->pump = REXCVAR_GET(audio_switch_bomba);
+   output->tramas_en_cola = static_cast<size_t>(std::clamp(REXCVAR_GET(audio_switch_tramas_en_cola), 2, 32));
+-  REXLOG_INFO("SwitchAudioSystem: bomba de 187,5 Hz {}, {} tramas en cola", output->pump ? "activa" : "apagada",
++  REXLOG_INFO("SwitchAudioSystem: 187.5 Hz pump {}, {} frames queued", output->pump ? "on" : "off",
+               output->tramas_en_cola);
+ 
+   Result rc = audoutInitialize();
+diff --git a/sdk/src/audio/xma_context.cpp b/sdk/src/audio/xma_context.cpp
+index a902d01..36ce862 100644
+--- a/sdk/src/audio/xma_context.cpp
++++ b/sdk/src/audio/xma_context.cpp
+@@ -50,16 +50,16 @@ extern "C" {
+ // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
+ 
+ REXCVAR_DEFINE_INT32(audio_volcado_xma_s, 0, "Audio",
+-                     "Diagnostico: segundos de cada contexto XMA que se guardan en "
+-                     "xma_<contexto>_tramas/salida_<hz>.wav junto al ejecutable; 0 = nada");
++                     "Diagnostic: seconds of each XMA context saved to "
++                     "xma_<context>_tramas/salida_<hz>.wav next to the executable; 0 = none");
+ REXCVAR_DEFINE_INT32(audio_volcado_xma_desde_s, 0, "Audio",
+-                     "Diagnostico: segundos desde el primer audio XMA antes de empezar a volcar");
++                     "Diagnostic: seconds from the first XMA audio before dumping starts");
+ REXCVAR_DEFINE_INT32(audio_volcado_xma_contextos, 12, "Audio",
+-                     "Diagnostico: contextos XMA que se vuelcan como mucho");
++                     "Diagnostic: most XMA contexts dumped");
+ REXCVAR_DEFINE_INT32(audio_volcado_xma_mb, 32, "Audio",
+-                     "Diagnostico: megas como mucho de audio XMA acumulado sin escribir");
++                     "Diagnostic: most MB of XMA audio held before writing");
+ REXCVAR_DEFINE_INT32(audio_volcado_xma_min_s, 2, "Audio",
+-                     "Diagnostico: segundos minimos de un sonido XMA que se guardan cuando termina");
++                     "Diagnostic: shortest XMA sound, in seconds, saved when it ends");
+ 
+ namespace {
+ 
+@@ -113,8 +113,8 @@ void EscribirVolcadoXmaEnHilo(uint32_t contexto, int tipo, const VolcadoXma& v)
+   fichero.write("data", 4);
+   u32(bytes);
+   fichero.write(reinterpret_cast<const char*>(v.muestras.data()), bytes);
+-  REXAPU_INFO("XMA: volcado {} del contexto {}: {} muestras a {} Hz, {} canales",
+-              tipo ? "de salida" : "de tramas", contexto, v.muestras.size() / v.canales,
++  REXAPU_INFO("XMA: {} dump of context {}: {} samples at {} Hz, {} channels",
++              tipo ? "output" : "frames", contexto, v.muestras.size() / v.canales,
+               v.frecuencia, v.canales);
+ }
+ 
+@@ -215,7 +215,7 @@ void VolcarXma(uint32_t contexto, int tipo, uint32_t frecuencia, uint32_t canale
+   }
+   if (v.muestras.empty() && tipo == 0 && anotados_xma < 64) {
+     ++anotados_xma;
+-    REXAPU_INFO("XMA: contexto {} con audio a {} Hz, {} canales", contexto, frecuencia, canales);
++    REXAPU_INFO("XMA: context {} with audio at {} Hz, {} channels", contexto, frecuencia, canales);
+   }
+   if (v.muestras.empty()) {
+     v.secuencia = ++secuencia_volcados_xma;
+@@ -359,9 +359,9 @@ void XmaContext::AnotarProduccion(bool produjo, uint8_t motivo, const XMA_CONTEX
+   en_silencio_ = false;
+   const double ms = std::chrono::duration<double, std::milli>(ahora - silencio_desde_).count();
+   if (ms >= 50.0 && lineas.fetch_add(1, std::memory_order_relaxed) < 200) {
+-    REXLOG_INFO("[xma] silencio: el contexto {} estuvo {:.0f} ms sin producir y vuelve a sonar ({} pasadas vacias, "
+-                "ultimo motivo {}: 1 solo vaciar, 2 sin entrada, 3 sin avance, 4 error; entradas {}{}, bufer actual {}, "
+-                "bucles {})",
++    REXLOG_INFO("[xma] silence: context {} produced nothing for {:.0f} ms and plays again ({} empty passes, "
++                "last reason {}: 1 drain only, 2 no input, 3 no progress, 4 error; inputs {}{}, current buffer {}, "
++                "loops {})",
+                 id_, ms, silencio_pasadas_, silencio_motivo_, uint32_t(data.input_buffer_0_valid),
+                 uint32_t(data.input_buffer_1_valid), uint32_t(data.current_buffer), uint32_t(data.loop_count));
+   }
+diff --git a/sdk/src/audio/xma_decoder.cpp b/sdk/src/audio/xma_decoder.cpp
+index 3a1bebb..11c628c 100644
+--- a/sdk/src/audio/xma_decoder.cpp
++++ b/sdk/src/audio/xma_decoder.cpp
+@@ -33,8 +33,8 @@ extern "C" {
+ 
+ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
+ REXCVAR_DEFINE_BOOL(audio_ffmpeg_simd, true, "Audio",
+-                    "Diagnostico: false = el decodificador XMA de FFmpeg usa solo codigo C, sin "
+-                    "NEON ni SSE (para comparar el audio)");
++                    "Diagnostic: false = FFmpeg's XMA decoder uses C code only, without "
++                    "NEON or SSE (to compare the audio)");
+ REXCVAR_DECLARE(bool, audio_diag_prioridad_critica);  // definida en audio_system.cpp
+ /*
+  * On by default only on the Switch, like the server priority and the frame wait: there the game's
+@@ -51,10 +51,10 @@ REXCVAR_DECLARE(bool, audio_diag_prioridad_critica);  // definida en audio_syste
+ #define REX_XMA_EN_TRABAJADOR_POR_DEFECTO 0
+ #endif
+ REXCVAR_DEFINE_INT32(audio_xma_en_trabajador, REX_XMA_EN_TRABAJADOR_POR_DEFECTO, "Audio",
+-                     "Quien descodifica el XMA al llegar un kick (XMAEnableContext): 0 = el hilo que lo pide, "
+-                     "como hasta ahora; 1 = el hilo XMA Decoder, que en la Switch va a 0x2B y no lo preempta "
+-                     "el anillo de la GPU; 2 = el trabajador, y el hilo que pide el kick solo termina los "
+-                     "contextos que el trabajador no haya cogido (para el PC, donde no hay esas prioridades)");
++                     "Who decodes XMA when a kick arrives (XMAEnableContext): 0 = the thread that asks, "
++                     "as before; 1 = the XMA Decoder thread, which runs at 0x2B on the Switch and is not "
++                     "preempted by the GPU ring; 2 = the worker, and the kicking thread only finishes the "
++                     "contexts the worker has not taken (for the PC, which lacks those priorities)");
+ 
+ // As with normal Microsoft, there are like twelve different ways to access
+ // the audio APIs. Early games use XMA*() methods almost exclusively to touch
+@@ -121,7 +121,7 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
+   // MDCT, float_dsp) be chosen without SIMD.
+   if (!REXCVAR_GET(audio_ffmpeg_simd)) {
+     av_force_cpu_flags(0);
+-    REXAPU_INFO("XMA: FFmpeg sin SIMD (audio_ffmpeg_simd = false)");
++    REXAPU_INFO("XMA: FFmpeg without SIMD (audio_ffmpeg_simd = false)");
+   }
+ 
+   // Register APU/XMA MMIO handlers
+@@ -279,12 +279,12 @@ void InformarXma() {
+   const uint64_t latencia_ns = g_medida_xma.latencia_ns.exchange(0, std::memory_order_relaxed);
+   const uint64_t latencia_max = g_medida_xma.latencia_max_ns.exchange(0, std::memory_order_relaxed);
+   const uint64_t latencia_n = g_medida_xma.latencia_n.exchange(0, std::memory_order_relaxed);
+-  REXLOG_INFO("[xma] en el hilo que llama, {:.1f} s: kicks {} con {} contextos descodificados, {:.1f} ms (maximo "
+-              "{:.2f} ms); locks {} con {} contextos, {:.1f} ms esperando (maximo {:.2f} ms)",
++  REXLOG_INFO("[xma] on the calling thread, {:.1f} s: kicks {} with {} contexts decoded, {:.1f} ms (max "
++              "{:.2f} ms); locks {} with {} contexts, {:.1f} ms waiting (max {:.2f} ms)",
+               double(ahora - ultimo) / 1000.0, kicks, kick_contextos, double(kick_ns) / 1e6, double(kick_max) / 1e6,
+               locks, lock_contextos, double(lock_ns) / 1e6, double(lock_max) / 1e6);
+-  REXLOG_INFO("[xma] reparto (modo {}): trabajador {} contextos en {:.1f} ms (maximo {:.2f} ms), respaldo del hilo "
+-              "del kick {}; del kick al dato listo media {:.0f} us y maxima {:.2f} ms ({} medidas)",
++  REXLOG_INFO("[xma] split (mode {}): worker {} contexts in {:.1f} ms (max {:.2f} ms), fallback on the kicking "
++              "thread {}; from kick to data ready mean {:.0f} us and max {:.2f} ms ({} measurements)",
+               REXCVAR_GET(audio_xma_en_trabajador), del_trabajador, double(trabajo_ns) / 1e6,
+               double(trabajo_max) / 1e6, del_respaldo,
+               latencia_n ? double(latencia_ns) / double(latencia_n) / 1e3 : 0.0, double(latencia_max) / 1e6,
+diff --git a/sdk/src/core/exception_handler_switch.cpp b/sdk/src/core/exception_handler_switch.cpp
+index acc47d0..1817540 100644
+--- a/sdk/src/core/exception_handler_switch.cpp
++++ b/sdk/src/core/exception_handler_switch.cpp
+@@ -113,8 +113,8 @@ alignas(16) uint32_t g_rex_exc_ocupadas[REX_EXC_RANURAS];
+ }
+ 
+ static_assert(sizeof(ThreadExceptionDump) <= REX_EXC_VOLCADO,
+-              "el volcado ya no cabe en la ranura");
+-static_assert(REX_EXC_RANURAS == 8, "el ensamblador compara contra 8 a mano");
++              "the dump no longer fits in the slot");
++static_assert(REX_EXC_RANURAS == 8, "the assembly compares against 8 by hand");
+ 
+ /*
+  * The exception entry, replacing libnx's
+@@ -383,11 +383,11 @@ void ScanStack(CrashBuf& b, uint64_t stack, uint64_t base, uint64_t text_lo, uin
+   stack &= ~uint64_t(7);
+   MemoryInfo mi;
+   if (!QueryReadable(stack, 8, &mi)) {
+-    Append(b, "pila ilegible en 0x%016" PRIx64 "\n", stack);
++    Append(b, "stack unreadable at 0x%016" PRIx64 "\n", stack);
+     return;
+   }
+   const uint64_t end = std::min(mi.addr + mi.size, stack + 0x10000);
+-  Append(b, "posibles retornos en la pila (0x%016" PRIx64 "):\n", stack);
++  Append(b, "possible return addresses on the stack (0x%016" PRIx64 "):\n", stack);
+   int hits = 0;
+   for (uint64_t p = stack; p + 8 <= end && hits < 48; p += 8) {
+     const uint64_t v = *reinterpret_cast<const uint64_t*>(p);
+@@ -451,28 +451,28 @@ extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump*
+   svcGetThreadId(&tid, CUR_THREAD_HANDLE);
+ 
+   Append(b, "==== %s ====\n", reason ? reason : "?");
+-  Append(b, "hilo %" PRIu64 ", imagen 0x%016" PRIx64 " (codigo hasta 0x%016" PRIx64 ")\n", tid,
++  Append(b, "thread %" PRIu64 ", image 0x%016" PRIx64 " (code up to 0x%016" PRIx64 ")\n", tid,
+          base, text_hi);
+-  Append(b, "pc 0x%016" PRIx64 " = imagen+0x%" PRIx64 "\n", pc, pc - base);
++  Append(b, "pc 0x%016" PRIx64 " = image+0x%" PRIx64 "\n", pc, pc - base);
+ 
+   if (ctx) {
+     const uint32_t esr = ctx->esr;
+-    Append(b, "lr 0x%016" PRIx64 " = imagen+0x%" PRIx64 "\n", ctx->lr.x, ctx->lr.x - base);
++    Append(b, "lr 0x%016" PRIx64 " = image+0x%" PRIx64 "\n", ctx->lr.x, ctx->lr.x - base);
+     Append(b, "esr 0x%08x (EC 0x%02x)  far 0x%016" PRIx64 "  error_desc 0x%x  pstate 0x%08x\n",
+            esr, esr >> 26, ctx->far.x, ctx->error_desc, ctx->pstate);
+     if (QueryReadable(pc, 4, &mi) && (mi.perm & Perm_X)) {
+-      Append(b, "instruccion 0x%08x\n", *reinterpret_cast<const uint32_t*>(pc));
++      Append(b, "instruction 0x%08x\n", *reinterpret_cast<const uint32_t*>(pc));
+     }
+     MemoryInfo fm;
+     u32 page_info = 0;
+     if (R_SUCCEEDED(svcQueryMemory(&fm, &page_info, ctx->far.x))) {
+       Append(b,
+-             "far en region 0x%016" PRIx64 "+0x%" PRIx64 " tipo 0x%x permisos 0x%x\n",
++             "far in region 0x%016" PRIx64 "+0x%" PRIx64 " type 0x%x permissions 0x%x\n",
+              fm.addr, fm.size, fm.type, fm.perm);
+     }
+     const uint64_t gm = reinterpret_cast<uint64_t>(RexGmBase());
+     if (gm && ctx->far.x >= gm && ctx->far.x < gm + RexGmSize()) {
+-      Append(b, "far dentro de la memoria del invitado: 0x%08" PRIx64 "\n", ctx->far.x - gm);
++      Append(b, "far inside guest memory: 0x%08" PRIx64 "\n", ctx->far.x - gm);
+     }
+     for (int i = 0; i < 29; ++i) {
+       Append(b, "x%-2d 0x%016" PRIx64 "%s", i, ctx->cpu_gprs[i].x, (i % 3 == 2) ? "\n" : "  ");
+@@ -483,13 +483,13 @@ extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump*
+   // Frame chain: the ELF keeps x29 as the frame pointer (the Atmosphere report of
+   // the first abort walked it completely). More reliable than the scan below,
+   // which remains as a fallback for when the chain breaks.
+-  Append(b, "cadena de marcos:\n");
++  Append(b, "frame chain:\n");
+   uint64_t frame = ctx ? ctx->fp.x : stack;
+   for (int i = 0; i < 40 && (frame & 7) == 0 && QueryReadable(frame, 16, &mi); ++i) {
+     const uint64_t next = reinterpret_cast<const uint64_t*>(frame)[0];
+     const uint64_t ret = reinterpret_cast<const uint64_t*>(frame)[1];
+     if (ret >= text_lo && ret < text_hi) {
+-      Append(b, "  #%02d imagen+0x%" PRIx64 "\n", i, ret - base);
++      Append(b, "  #%02d image+0x%" PRIx64 "\n", i, ret - base);
+     } else {
+       Append(b, "  #%02d 0x%016" PRIx64 "\n", i, ret);
+     }
+@@ -507,8 +507,8 @@ extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump*
+ 
+ namespace rex::arch {
+ 
+-static_assert(sizeof(vec128_t) == 16, "vec128_t ya no mide 16 bytes");
+-static_assert(sizeof(FpuRegister) == 16, "FpuRegister ya no mide 16 bytes");
++static_assert(sizeof(vec128_t) == 16, "vec128_t is no longer 16 bytes");
++static_assert(sizeof(FpuRegister) == 16, "FpuRegister is no longer 16 bytes");
+ 
+ namespace {
+ 
+@@ -752,7 +752,7 @@ void WriteBack(const Exception& ex, const HostThreadContext& tc, ThreadException
+   // not another exception: it ends with error 2345-0102.
+   (void)far;
+   (void)esr;
+-  RexSwitchCrashLog(data_abort ? "fallo de acceso a memoria" : "excepcion de CPU", ctx,
++  RexSwitchCrashLog(data_abort ? "memory access fault" : "CPU exception", ctx,
+                     ctx->sp.x, pc);
+   diagAbortWithResult(MAKERESULT(Module_Libnx, 102));
+ }
+diff --git a/sdk/src/core/fiber_switch.cpp b/sdk/src/core/fiber_switch.cpp
+index f9583f7..ba74a09 100644
+--- a/sdk/src/core/fiber_switch.cpp
++++ b/sdk/src/core/fiber_switch.cpp
+@@ -55,7 +55,7 @@ static_assert(offsetof(Ctx, d8) == 104, "Context: d8 movido");
+ static_assert(offsetof(Ctx, d10) == 120, "Context: d10 movido");
+ static_assert(offsetof(Ctx, d12) == 136, "Context: d12 movido");
+ static_assert(offsetof(Ctx, d14) == 152, "Context: d14 movido");
+-static_assert(sizeof(Ctx) == 168, "Context: tamano cambiado");
++static_assert(sizeof(Ctx) == 168, "Context: size changed");
+ 
+ }  // namespace
+ 
+@@ -156,7 +156,7 @@ void Fiber::Destroy() {
+   if (is_thread_fiber_) {
+     tls_current_ = nullptr;
+   } else {
+-    assert(this != tls_current_ && "Destroy sobre la fibra que esta corriendo");
++    assert(this != tls_current_ && "Destroy on the running fiber");
+   }
+   delete this;
+ }
+@@ -170,7 +170,7 @@ extern "C" [[noreturn]] void rex_fiber_trampoline(void) {
+   f->entry_(f->arg_);
+   // entry_ must not return: there is no context to go back to, this fiber's
+   // stack ends here.
+-  assert(false && "la funcion de entrada de una fibra ha vuelto");
++  assert(false && "a fiber entry function returned");
+   std::abort();
+ }
+ 
+diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_switch.cpp
+index 34cd4ed..d598189 100644
+--- a/sdk/src/core/guest_memory_switch.cpp
++++ b/sdk/src/core/guest_memory_switch.cpp
+@@ -5,6 +5,7 @@
+ #include "guest_memory_switch.h"
+ 
+ #include <malloc.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <switch.h>
+ 
+@@ -460,6 +461,8 @@ bool RexGmAddView(uint8_t* base, size_t offset, size_t length) {
+     return true;
+ }
+ 
++static bool CommitLocked(State& s, size_t offset, size_t length);
++
+ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+     /*
+      * Memory is always committed accessible. Restricting permissions is the job of
+@@ -477,7 +480,11 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+     State& s = S();
+     std::lock_guard<std::mutex> lock(s.mutex);
+     if (!s.base) return false;
++    return CommitLocked(s, offset, length);
++}
+ 
++/* RexGmCommit's body; the caller holds s.mutex (also used by RexGmFaultIn's commit on demand). */
++static bool CommitLocked(State& s, size_t offset, size_t length) {
+     const size_t begin = AlignDown(offset, kPageSize);
+     const size_t end   = AlignUp(offset + length, kPageSize);
+ 
+@@ -569,7 +576,25 @@ bool RexGmFaultIn(uint64_t window_address) {
+                        static_cast<size_t>(window_address -
+                                            reinterpret_cast<uint64_t>(s.views[vi].base));
+     Chunk* c = ChunkAt(s, off);
+-    if (!c) return false;                                       /* sin confirmar */
++    if (!c) {
++        /*
++         * LEGO Batman port: commit on demand. On the PC every view is mapped over one fully backed file, so a guest
++         * write to memory nobody committed (LEGO Batman's memcpy into the 0xE0000000 physical view right after
++         * New Game) simply lands; here it was an unhandled fault. Commit the surrounding block (whole blocks keep
++         * the number of Horizon mappings low) and map it like any committed chunk.
++         */
++        const size_t block = AlignDown(off, kBlockSize);
++        if (!CommitLocked(s, block, kBlockSize)) return false;
++        c = ChunkAt(s, off);
++        if (!c) return false;
++        static unsigned logged = 0;
++        if (logged < 32) {
++            logged++;
++            std::printf("[gm] committed on demand: offset 0x%zx (block 0x%zx, %zu KB) for a fault at window +0x%zx\n",
++                        off, block, kBlockSize >> 10, win_off);
++            std::fflush(stdout);
++        }
++    }
+     if (s.view_mapped.count({vi, c->offset}) != 0) return false; /* ya estaba */
+     return MapChunkIntoView(s, vi, *c);
+ }
+diff --git a/sdk/src/core/logging.cpp b/sdk/src/core/logging.cpp
+index 2097fed..f9e7a0d 100644
+--- a/sdk/src/core/logging.cpp
++++ b/sdk/src/core/logging.cpp
+@@ -102,11 +102,11 @@ REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files
+  * ================================================================================================
+  */
+ REXCVAR_DEFINE_BOOL(log_async, false, "Log",
+-                    "Escribir el log desde un hilo aparte (el hilo que llama solo encola). Quita los "
+-                    "tirones del volcado periodico; false pierde los ultimos mensajes si hay cuelgue")
++                    "Write the log from a separate thread (the calling thread only queues). Removes the "
++                    "stutters of the periodic flush; false loses the last messages on a hang")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+-REXCVAR_DEFINE_INT32(log_async_cola, 8192, "Log", "Mensajes que caben en la cola del log asincrono")
++REXCVAR_DEFINE_INT32(log_async_cola, 8192, "Log", "Messages that fit in the async log queue")
+     .range(256, 65536)
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+@@ -290,7 +290,8 @@ void InitLogging(const LogConfig& config) {
+                                           : std::filesystem::path(config.log_dir);
+     resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
+   }
+-  if (!resolved_path.empty()) {
++  // LEGO Batman port: no file at all when logging is off (a release build: a new numbered file per run otherwise).
++  if (!resolved_path.empty() && REXCVAR_GET(log_level) != std::string("off")) {
+     auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+         resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
+         static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
+diff --git a/sdk/src/core/mapped_memory_switch.cpp b/sdk/src/core/mapped_memory_switch.cpp
+index 8055b40..a3567f5 100644
+--- a/sdk/src/core/mapped_memory_switch.cpp
++++ b/sdk/src/core/mapped_memory_switch.cpp
+@@ -129,9 +129,9 @@ std::unique_ptr<MappedMemory> MappedMemory::Open(const std::filesystem::path& pa
+   }
+ 
+   if (len > kMaxInMemoryFile) {
+-    REXLOG_ERROR("MappedMemory: '{}' pide {} MB y en Switch no hay mmap de ficheros, asi que "
+-                 "habria que leerlo entero a RAM. Si es la ISO del juego, usa los ficheros "
+-                 "EXTRAIDOS (carpeta game_root) en su lugar.",
++    REXLOG_ERROR("MappedMemory: '{}' needs {} MB and the Switch has no file mmap, so it "
++                 "would have to be read whole into RAM. If it is the game's ISO, use the "
++                 "EXTRACTED files (game_root folder) instead.",
+                  ruta, len >> 20);
+     fclose(f);
+     return nullptr;
+@@ -140,7 +140,7 @@ std::unique_ptr<MappedMemory> MappedMemory::Open(const std::filesystem::path& pa
+   const size_t reservado = (len + kPage - 1) & ~(kPage - 1);
+   uint8_t* datos = static_cast<uint8_t*>(memalign(kPage, reservado));
+   if (!datos) {
+-    REXLOG_ERROR("MappedMemory: sin memoria para leer '{}' ({} MB)", ruta, len >> 20);
++    REXLOG_ERROR("MappedMemory: out of memory reading '{}' ({} MB)", ruta, len >> 20);
+     fclose(f);
+     return nullptr;
+   }
+diff --git a/sdk/src/core/memory_switch.cpp b/sdk/src/core/memory_switch.cpp
+index da1643f..c2815b0 100644
+--- a/sdk/src/core/memory_switch.cpp
++++ b/sdk/src/core/memory_switch.cpp
+@@ -132,8 +132,8 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+   }
+ 
+   if (!InWindow(base_address, length)) {
+-    REXLOG_ERROR("AllocFixed en Switch fuera de la ventana del invitado: 0x{:016X} (0x{:X} bytes). "
+-                 "Horizon no permite fijar direcciones arbitrarias.",
++    REXLOG_ERROR("AllocFixed on Switch outside the guest window: 0x{:016X} (0x{:X} bytes). "
++                 "Horizon does not allow fixing arbitrary addresses.",
+                  reinterpret_cast<uintptr_t>(base_address), length);
+     return nullptr;
+   }
+@@ -146,7 +146,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+ 
+   size_t offset = 0;
+   if (!RexGmWindowToOffset(reinterpret_cast<uint64_t>(base_address), &offset)) {
+-    REXLOG_ERROR("AllocFixed: 0x{:016X} no pertenece a ninguna vista del invitado",
++    REXLOG_ERROR("AllocFixed: 0x{:016X} belongs to no guest view",
+                  reinterpret_cast<uintptr_t>(base_address));
+     return nullptr;
+   }
+@@ -159,8 +159,8 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+     // once more per 360 view. The limit figures come from the profiler
+     // (switch_perf.cpp); switch.h cannot be included here without clashing with
+     // the SDK types.
+-    REXLOG_ERROR("AllocFixed: no se pudo confirmar 0x{:X} bytes en 0x{:016X}. Fallo 0x{:08X}; "
+-                 "respaldo {} MB, mapeado {} MB contando espejos.",
++    REXLOG_ERROR("AllocFixed: could not commit 0x{:X} bytes at 0x{:016X}. Error 0x{:08X}; "
++                 "backed {} MB, mapped {} MB counting mirrors.",
+                  length, reinterpret_cast<uintptr_t>(base_address), RexGmLastResult(),
+                  RexGmCommittedBytes() >> 20, RexGmMappedBytes() >> 20);
+     return nullptr;
+@@ -170,8 +170,8 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+   // the requested permission is applied on top. In the common case (read-write on
+   // an unprotected range) this returns immediately.
+   if (!RexGmProtect(static_cast<uint8_t*>(base_address), length, ToGm(access), nullptr)) {
+-    REXLOG_ERROR("AllocFixed: confirmado pero no se pudo aplicar el permiso en 0x{:016X} "
+-                 "(fallo 0x{:08X})",
++    REXLOG_ERROR("AllocFixed: committed but could not apply the protection at 0x{:016X} "
++                 "(error 0x{:08X})",
+                  reinterpret_cast<uintptr_t>(base_address), RexGmLastResult());
+     return nullptr;
+   }
+@@ -213,7 +213,7 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+     *out_old_access = PageAccess::kNoAccess;
+   }
+   if (!InWindow(base_address, length)) {
+-    REXLOG_ERROR("Protect en Switch fuera de la ventana del invitado: 0x{:016X} (0x{:X} bytes)",
++    REXLOG_ERROR("Protect on Switch outside the guest window: 0x{:016X} (0x{:X} bytes)",
+                  reinterpret_cast<uintptr_t>(base_address), length);
+     return false;
+   }
+@@ -224,7 +224,7 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+     *out_old_access = FromGm(old);
+   }
+   if (!ok) {
+-    REXLOG_ERROR("Protect: fallo 0x{:08X} en 0x{:016X} (0x{:X} bytes)", RexGmLastResult(),
++    REXLOG_ERROR("Protect: error 0x{:08X} at 0x{:016X} (0x{:X} bytes)", RexGmLastResult(),
+                  reinterpret_cast<uintptr_t>(base_address), length);
+   }
+   return ok;
+@@ -259,8 +259,8 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+   // window of the guest memory core, and it is reserved here, empty. Real memory
+   // arrives with AllocFixed(kCommit).
+   if (!RexGmBase() && !RexGmInit(AlignUp(length))) {
+-    REXLOG_ERROR("No se pudo reservar la ventana del invitado de 0x{:X} bytes. "
+-                 "Hace falta title takeover: en modo applet no hay espacio.",
++    REXLOG_ERROR("Could not reserve the guest window of 0x{:X} bytes. "
++                 "Title takeover is needed: applet mode has no room.",
+                  length);
+     return kFileMappingHandleInvalid;
+   }
+@@ -284,8 +284,8 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
+     return nullptr;
+   }
+   if (!RexGmAddView(static_cast<uint8_t*>(base_address), file_offset, length)) {
+-    REXLOG_ERROR("MapFileView: no se pudo registrar la vista 0x{:016X} (0x{:X} bytes desde 0x{:X}); "
+-                 "fallo 0x{:08X}",
++    REXLOG_ERROR("MapFileView: could not register the view 0x{:016X} (0x{:X} bytes from 0x{:X}); "
++                 "error 0x{:08X}",
+                  reinterpret_cast<uintptr_t>(base_address), length, file_offset,
+                  RexGmLastResult());
+     return nullptr;
+diff --git a/sdk/src/core/resume_ctx.h b/sdk/src/core/resume_ctx.h
+index 6edcf99..9609cc8 100644
+--- a/sdk/src/core/resume_ctx.h
++++ b/sdk/src/core/resume_ctx.h
+@@ -58,21 +58,21 @@ __attribute__((noreturn)) void RexResumeFromException(ThreadExceptionDump* ctx);
+  * instead of jumping to a made-up address.
+  */
+ _Static_assert(offsetof(ThreadExceptionDump, cpu_gprs) == 16, "gprs movidos");
+-_Static_assert(sizeof(CpuRegister) == 8, "CpuRegister ya no son 8 bytes");
++_Static_assert(sizeof(CpuRegister) == 8, "CpuRegister is no longer 8 bytes");
+ _Static_assert(offsetof(ThreadExceptionDump, fp) == 248, "fp movido");
+ _Static_assert(offsetof(ThreadExceptionDump, lr) == 256, "lr movido");
+ _Static_assert(offsetof(ThreadExceptionDump, sp) == 264, "sp movido");
+ _Static_assert(offsetof(ThreadExceptionDump, pc) == 272, "pc movido");
+ _Static_assert(offsetof(ThreadExceptionDump, fpu_gprs) == 288, "NEON movidos");
+-_Static_assert(sizeof(FpuRegister) == 16, "FpuRegister ya no son 16 bytes");
++_Static_assert(sizeof(FpuRegister) == 16, "FpuRegister is no longer 16 bytes");
+ _Static_assert(offsetof(ThreadExceptionDump, pstate) == 800, "pstate movido");
+ _Static_assert(offsetof(ThreadExceptionDump, far) == 816, "far movido");
+-_Static_assert(sizeof(ThreadExceptionDump) <= 0x340, "el volcado ya no cabe en la copia");
++_Static_assert(sizeof(ThreadExceptionDump) <= 0x340, "the dump no longer fits in the copy");
+ /* The frame the kernel restores, the one the exception entry writes. */
+-_Static_assert(offsetof(ThreadExceptionFrameA64, lr) == 72, "lr del marco movido");
+-_Static_assert(offsetof(ThreadExceptionFrameA64, sp) == 80, "sp del marco movido");
+-_Static_assert(offsetof(ThreadExceptionFrameA64, elr_el1) == 88, "pc del marco movido");
+-_Static_assert(offsetof(ThreadExceptionFrameA64, pstate) == 96, "pstate del marco movido");
++_Static_assert(offsetof(ThreadExceptionFrameA64, lr) == 72, "frame lr moved");
++_Static_assert(offsetof(ThreadExceptionFrameA64, sp) == 80, "frame sp moved");
++_Static_assert(offsetof(ThreadExceptionFrameA64, elr_el1) == 88, "frame pc moved");
++_Static_assert(offsetof(ThreadExceptionFrameA64, pstate) == 96, "frame pstate moved");
+ 
+ __asm__(
+     ".text\n"
+diff --git a/sdk/src/core/switch_libc_supplement.c b/sdk/src/core/switch_libc_supplement.c
+index d604044..15dd95c 100644
+--- a/sdk/src/core/switch_libc_supplement.c
++++ b/sdk/src/core/switch_libc_supplement.c
+@@ -214,7 +214,7 @@ void __assert_func(const char* file, int line, const char* func, const char* exp
+         snprintf(ruta, sizeof(ruta), "%srex_assert.log", RexSwitchLogDir());
+         FILE* f = fopen(ruta, "a");
+         if (f) {
+-            fprintf(f, "assert fallido: %s\n  en %s:%d (%s)\n", expr ? expr : "?",
++            fprintf(f, "assert failed: %s\n  at %s:%d (%s)\n", expr ? expr : "?",
+                     file ? file : "?", line, func ? func : "?");
+             fclose(f);
+         }
+diff --git a/sdk/src/filesystem/devices/host_path_device.cpp b/sdk/src/filesystem/devices/host_path_device.cpp
+index 9fdd2f3..35ae2db 100644
+--- a/sdk/src/filesystem/devices/host_path_device.cpp
++++ b/sdk/src/filesystem/devices/host_path_device.cpp
+@@ -78,10 +78,10 @@ bool HostPathDevice::Initialize() {
+   PopulateEntry(root_entry);
+   const double ms =
+       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - antes).count();
+-  REXFS_INFO("[io] montado '{}' en {}: {} entradas en {:.1f} ms ({})",
++  REXFS_INFO("[io] mounted '{}' at {}: {} entries in {:.1f} ms ({})",
+              rex::path_to_utf8(host_path_), mount_path_,
+              g_entradas_en_arbol.load(std::memory_order_relaxed) - entradas_antes, ms,
+-             read_only_ ? "solo lectura" : "escritura");
++             read_only_ ? "read-only" : "writable");
+ 
+   return true;
+ }
+diff --git a/sdk/src/filesystem/devices/host_path_file.cpp b/sdk/src/filesystem/devices/host_path_file.cpp
+index 15e12ce..ae927c5 100644
+--- a/sdk/src/filesystem/devices/host_path_file.cpp
++++ b/sdk/src/filesystem/devices/host_path_file.cpp
+@@ -36,12 +36,12 @@
+  * 128 x 64 KB = 8 MB.
+  */
+ REXCVAR_DEFINE_INT32(nfsmw_io_ventana_kb, 256, "Filesystem",
+-                     "Lectura anticipada por fichero, en KB (0 = apagada). Solo datos de solo lectura.");
++                     "Read-ahead per file, in KB (0 = off). Read-only data only.");
+ 
+ // How many windows can exist at once. A hard cap so that opening many files does not eat the RAM.
+ // 128 was an arbitrary number; in a whole measured session there were never more than 10 live windows.
+ REXCVAR_DEFINE_INT32(nfsmw_io_ventanas_max, 16, "Filesystem",
+-                     "Maximo de ficheros con lectura anticipada a la vez.");
++                     "Most files with read-ahead at once.");
+ 
+ /*
+  * Split large direct reads into pieces of this many MB. 0 = a single call.
+@@ -66,7 +66,7 @@ REXCVAR_DEFINE_INT32(nfsmw_io_ventanas_max, 16, "Filesystem",
+  * bounds the worst case and fixes short reads, not because a gain is expected.
+  */
+ REXCVAR_DEFINE_INT32(nfsmw_io_trozo_mb, 4, "Filesystem",
+-                     "Parte las lecturas directas grandes en trozos de estos MB (0 = de una sola vez).");
++                     "Splits large direct reads into pieces of this many MB (0 = all at once).");
+ 
+ /*
+  * RAM read cache by blocks (nfsmw_io_cache_mb, off). The game rereads the same data from the SD
+@@ -110,8 +110,8 @@ REXCVAR_DEFINE_INT32(nfsmw_io_trozo_mb, 4, "Filesystem",
+  * ================================================================================================
+  */
+ REXCVAR_DEFINE_INT32(nfsmw_io_cache_mb, 0, "Filesystem",
+-                     "Cache en RAM de lo ya leido del disco, en MB (0 = apagada). Solo datos de solo "
+-                     "lectura. El juego relee cada vuelta lo mismo.");
++                     "RAM cache of what was already read from disk, in MB (0 = off). Read-only "
++                     "data only. The game rereads the same data every lap.");
+ 
+ /*
+  * Read cache by exact range. This is the second attempt, not the block cache above.
+@@ -169,21 +169,21 @@ REXCVAR_DEFINE_INT32(nfsmw_io_cache_mb, 0, "Filesystem",
+  * and the thread stacks, 64 MB leaves margin; 128 would not in the pessimistic case.
+  */
+ REXCVAR_DEFINE_INT32(nfsmw_io_rangos_mb, 64, "Filesystem",
+-                     "Cache de lecturas por rango exacto, tope total en MB (0 = apagada). 64 = la huella "
+-                     "medida de una carrera (56,6 MB) sin expulsiones; mas no compra nada.");
++                     "Cache of reads by exact range, total cap in MB (0 = off). 64 = the measured "
++                     "footprint of a race (56.6 MB) without evictions; more buys nothing.");
+ 
+ // Floor, in KB. At 4 MB it left out everything that is reread during a race (0.14-2.0 MB).
+ REXCVAR_DEFINE_INT32(nfsmw_io_rangos_min_kb, 256, "Filesystem",
+-                     "Solo se cachean las lecturas de estos KB o mas. 256 = el punto donde la simulacion "
+-                     "deja de ganar (con 128 suben las expulsiones y bajan los aciertos).");
++                     "Only reads of this many KB or more are cached. 256 = the point where the simulation "
++                     "stops gaining (at 128 evictions rise and hits fall).");
+ 
+ // Compatibility: the old cvar in MB. If a toml sets it to a value > 0, it overrides the KB one.
+ REXCVAR_DEFINE_INT32(nfsmw_io_rangos_min_mb, 0, "Filesystem",
+-                     "OBSOLETO (build 131): usar nfsmw_io_rangos_min_kb. Si es > 0 manda sobre el de KB.");
++                     "OBSOLETE (build 131): use nfsmw_io_rangos_min_kb. If > 0 it overrides the KB one.");
+ 
+ // Per-entry ceiling: a single read cannot take more than this out of the total cap.
+ REXCVAR_DEFINE_INT32(nfsmw_io_rangos_max_mb, 12, "Filesystem",
+-                     "Ninguna entrada de la cache de rangos pasa de estos MB.");
++                     "No range-cache entry exceeds this many MB.");
+ 
+ namespace rex::filesystem {
+ 
+@@ -329,8 +329,8 @@ bool LeerConCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_t
+         g_cache.clear();
+         g_cache_lru.clear();
+         g_cache_bytes = 0;
+-        REXLOG_WARN("[io] cache en RAM: sin memoria, se apaga (iba por {} MB). El juego sigue leyendo "
+-                    "del disco como antes",
++        REXLOG_WARN("[io] RAM cache: out of memory, turning it off (it was at {} MB). The game keeps reading "
++                    "from disk as before",
+                     tenia);
+         return false;
+       }
+@@ -360,9 +360,9 @@ bool LeerConCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_t
+   const uint64_t vueltas = g_cache_aciertos + g_cache_fallos;
+   if (vueltas >= g_cache_informe + 200) {
+     g_cache_informe = vueltas;
+-    REXLOG_INFO("[io] cache en RAM: {} bloques ({} MB de {}), {} servidas de RAM y {} del disco "
+-                "({:.1f} % de aciertos); {:.1f} MB entregados, {:.1f} leidos de la SD, {} bloques "
+-                "expulsados",
++    REXLOG_INFO("[io] RAM cache: {} blocks ({} MB of {}), {} served from RAM and {} from disk "
++                "({:.1f} % hits); {:.1f} MB delivered, {:.1f} read from the SD, {} blocks "
++                "evicted",
+                 g_cache.size(), g_cache_bytes >> 20, REXCVAR_GET(nfsmw_io_cache_mb), g_cache_aciertos,
+                 g_cache_fallos, vueltas ? 100.0 * double(g_cache_aciertos) / double(vueltas) : 0.0,
+                 double(g_cache_bytes_servidos) / 1048576.0, double(g_cache_bytes_disco) / 1048576.0,
+@@ -523,8 +523,8 @@ void GuardarRango(uint32_t id, uint64_t desplazamiento, uint32_t pedido, const u
+     }
+     g_rangos_entradas.store(0, std::memory_order_relaxed);
+     g_rangos_bytes_vivos.store(0, std::memory_order_relaxed);
+-    REXLOG_WARN("[io] rangos-cache: sin memoria, se apaga (iba por {} MB). El juego sigue leyendo "
+-                "del disco como antes",
++    REXLOG_WARN("[io] range cache: out of memory, turning it off (it was at {} MB). The game keeps reading "
++                "from disk as before",
+                 tenia);
+     return;
+   }
+diff --git a/sdk/src/graphics/CMakeLists.txt b/sdk/src/graphics/CMakeLists.txt
+index ea4789c..91f119e 100644
+--- a/sdk/src/graphics/CMakeLists.txt
++++ b/sdk/src/graphics/CMakeLists.txt
+@@ -96,6 +96,10 @@ if(REXGLUE_USE_D3D12)
+         ${REXGPU_XENOS_D3D12_SOURCES})
+ endif()
+ 
++# Backends from the game tree (LEGO Batman port, after cvhd-recomp): the game's CMakeLists sets
++# REXGPU_XENOS_EXTRA_SOURCES before including the SDK (trace / deko3d backends).
++list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_EXTRA_SOURCES})
++
+ if(REXGLUE_PLATFORM_SWITCH)
+     # Linked into the executable (gpu_plugin_loader.cpp calls rex_gpu_create
+     # directly); a NRO cannot load plugins at run time.
+diff --git a/sdk/src/graphics/command_processor.cpp b/sdk/src/graphics/command_processor.cpp
+index f80e13a..9371cdc 100644
+--- a/sdk/src/graphics/command_processor.cpp
++++ b/sdk/src/graphics/command_processor.cpp
+@@ -1097,7 +1097,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
+         } else {
++#if REX_PLATFORM_SWITCH
++          // LEGO Batman port (perf, after cvhd-recomp 0.233): the game's packet asks wait/0x100 ms, often several,
++          // while its own thread spins on the same fence: each unmet poll was frame latency. 100 us answers the
++          // fence within ~0.1 ms (cvhd: 1 ms -> 100 us was its first visible gain after the bulk register writes).
++          rex::thread::Sleep(std::chrono::microseconds(100));
++#else
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++#endif
+         }
+         rex::thread::SyncMemory();
+         ReturnFromWait();
+diff --git a/sdk/src/graphics/plugin_main.cpp b/sdk/src/graphics/plugin_main.cpp
+index ec756d3..cd6a078 100644
+--- a/sdk/src/graphics/plugin_main.cpp
++++ b/sdk/src/graphics/plugin_main.cpp
+@@ -9,6 +9,7 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ 
++#include <string>
+ #include <string_view>
+ 
+ #include <rex/logging.h>
+@@ -21,6 +22,11 @@
+ #include <rex/graphics/vulkan/graphics_system.h>
+ #endif
+ 
++// Backends from the game tree (src/gpu/trace_backend.cpp in the LEGO Batman port, after cvhd-recomp) answer
++// backend names this plugin does not know (nullptr = unknown). A required symbol, not a weak default: in the
++// static Switch plugin the linker would keep a weak default and never pull the game's object in.
++extern "C" rex::system::IGraphicsSystem* rex_gpu_extra_backend(const char* name);
++
+ extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
+   return rex::system::kGpuPluginAbiVersion;
+ }
+@@ -48,6 +54,9 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
+     return new rex::graphics::vulkan::VulkanGraphicsSystem();
+   }
+ #endif
++  if (rex::system::IGraphicsSystem* extra = rex_gpu_extra_backend(std::string(backend).c_str())) {
++    return extra;
++  }
+   REXLOG_ERROR("rexgpu-xenos: requested backend '{}' is not compiled into this plugin", backend);
+   return nullptr;
+ }
+diff --git a/sdk/src/input/input_system.cpp b/sdk/src/input/input_system.cpp
+index 79f0aa1..98709e0 100644
+--- a/sdk/src/input/input_system.cpp
++++ b/sdk/src/input/input_system.cpp
+@@ -12,6 +12,8 @@
+ #include <chrono>
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
++#include <string>
+ 
+ #include <rex/dbg.h>
+ #include <rex/input/device_assignment.h>
+@@ -39,8 +41,8 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
+ 
+ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+ REXCVAR_DEFINE_BOOL(input_vibracion, false, "Input",
+-                    "Vibracion del mando (desactivada por defecto: a los mandos solo llega "
+-                    "vibracion cero). true = la vibracion del juego");
++                    "Controller vibration (off by default: the controllers only get "
++                    "zero vibration). true = the game's vibration");
+ namespace rex::input {
+ 
+ namespace {
+@@ -244,6 +246,16 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
+ }
+ 
++}  // namespace rex::input (closed for the debug-server globals)
++// LEGO Batman port: input set over the network by the game's debug server (legobatman/switch/host/debug_server.cpp).
++extern "C" {
++volatile int lb_dbg_input_on = 0;
++volatile uint16_t lb_dbg_buttons = 0;
++volatile int16_t lb_dbg_lx = 0, lb_dbg_ly = 0, lb_dbg_rx = 0, lb_dbg_ry = 0;
++volatile uint8_t lb_dbg_lt = 0, lb_dbg_rt = 0;
++}
++namespace rex::input {
++
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+@@ -274,6 +286,71 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+     }
+   }
+ 
++  // LEGO Batman port (testing): scripted input for player 0 from REX_INPUT_SCRIPT, so the debug host can reach
++  // gameplay unattended. Entries separated by commas:
++  //   T:btn        press btn for 0.15 s at T seconds after the first poll
++  //   T+P:btn      press btn every P seconds from T on
++  //   T-U:stick    hold the left stick (up/down/left/right) from T to U seconds
++  // Buttons: a b x y start back up down left right lb rb.
++  if (user_index == 0) {
++    static const char* script = std::getenv("REX_INPUT_SCRIPT");
++    if (script && *script) {
++      using clk = std::chrono::steady_clock;
++      static const clk::time_point t0 = clk::now();
++      const double t = std::chrono::duration<double>(clk::now() - t0).count();
++      uint16_t buttons = 0;
++      int16_t lx = 0, ly = 0;
++      auto bit = [](const std::string& n) -> uint16_t {
++        static const std::pair<const char*, uint16_t> names[] = {
++            {"up", 0x1}, {"down", 0x2}, {"left", 0x4}, {"right", 0x8}, {"start", 0x10}, {"back", 0x20},
++            {"lb", 0x100}, {"rb", 0x200}, {"a", 0x1000}, {"b", 0x2000}, {"x", 0x4000}, {"y", 0x8000}};
++        for (auto& e : names) if (n == e.first) return e.second;
++        return 0;
++      };
++      std::string all(script);
++      size_t pos = 0;
++      while (pos <= all.size()) {
++        size_t end = all.find(',', pos);
++        if (end == std::string::npos) end = all.size();
++        const std::string e = all.substr(pos, end - pos);
++        pos = end + 1;
++        const size_t colon = e.find(':');
++        if (colon == std::string::npos) continue;
++        const std::string when = e.substr(0, colon), what = e.substr(colon + 1);
++        double a = 0, b = 0;
++        if (when.find('+') != std::string::npos) {
++          a = std::atof(when.c_str());
++          b = std::atof(when.c_str() + when.find('+') + 1);
++          if (b > 0 && t >= a && std::fmod(t - a, b) < 0.15) buttons |= bit(what);
++        } else if (when.find('-', 1) != std::string::npos) {
++          a = std::atof(when.c_str());
++          b = std::atof(when.c_str() + when.find('-', 1) + 1);
++          if (t >= a && t < b) {
++            if (what == "up") ly = 32767; else if (what == "down") ly = -32767;
++            else if (what == "left") lx = -32767; else if (what == "right") lx = 32767;
++          }
++        } else {
++          a = std::atof(when.c_str());
++          if (t >= a && t < a + 0.15) buttons |= bit(what);
++        }
++      }
++      if (!any) { merged = {}; any = true; }
++      merged.gamepad.buttons = uint16_t(merged.gamepad.buttons) | buttons;
++      if (lx) merged.gamepad.thumb_lx = lx;
++      if (ly) merged.gamepad.thumb_ly = ly;
++      merged.packet_number = merged.packet_number + 1;
++    }
++  }
++  if (user_index == 0 && lb_dbg_input_on) {
++    if (!any) { merged = {}; any = true; }
++    merged.gamepad.buttons = uint16_t(merged.gamepad.buttons) | lb_dbg_buttons;
++    const int16_t lx = lb_dbg_lx, ly = lb_dbg_ly, rx = lb_dbg_rx, ry = lb_dbg_ry;
++    if (lx || ly) { merged.gamepad.thumb_lx = lx; merged.gamepad.thumb_ly = ly; }
++    if (rx || ry) { merged.gamepad.thumb_rx = rx; merged.gamepad.thumb_ry = ry; }
++    if (lb_dbg_lt) merged.gamepad.left_trigger = lb_dbg_lt;
++    if (lb_dbg_rt) merged.gamepad.right_trigger = lb_dbg_rt;
++    merged.packet_number = merged.packet_number + 1;
++  }
+   if (!any) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+diff --git a/sdk/src/kernel/xam/xam_content.cpp b/sdk/src/kernel/xam/xam_content.cpp
+index 78734b4..844ff30 100644
+--- a/sdk/src/kernel/xam/xam_content.cpp
++++ b/sdk/src/kernel/xam/xam_content.cpp
+@@ -227,7 +227,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+     // What the game asks for and what we answer, in one line. It is the only place where both paths
+     // are visible: the one that gets to create or open (which also leaves its own trace) and the one
+     // cut short because the content "does not exist", which used to be silent.
+-    REXKRNL_INFO("[guardado] XamContentCreate raiz «{}» contenido «{}» tipo {:08X} modo {} -> {} (resultado {:08X})",
++    REXKRNL_INFO("[save] XamContentCreate root '{}' content '{}' type {:08X} mode {} -> {} (result {:08X})",
+                  root_name, content_data.file_name(), static_cast<uint32_t>(content_data.content_type.get()), flags & 0xF,
+                  disposition == kDispositionState::Create  ? "crear"
+                  : disposition == kDispositionState::Open  ? "abrir"
+@@ -292,7 +292,7 @@ u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
+   // Closes a previously opened root from XamContentCreate*.
+   auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+   if (result != X_ERROR_SUCCESS) {
+-    REXKRNL_WARN("[guardado] XamContentClose raiz «{}»: no estaba abierta (resultado {:08X})",
++    REXKRNL_WARN("[save] XamContentClose root '{}': it was not open (result {:08X})",
+                  root_name.value(), uint32_t(result));
+   }
+ 
+diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_audio.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+index 5cfbb36..329b86a 100644
+--- a/sdk/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
++++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+@@ -36,11 +36,11 @@
+ #include <vector>
+ 
+ REXCVAR_DEFINE_INT32(audio_volcado_s, 0, "Audio",
+-                     "Diagnostico: segundos del audio que entrega el juego (6 canales, antes del "
+-                     "driver) que se guardan en audio_volcado_<cliente>.wav junto al ejecutable; "
+-                     "0 = nada");
++                     "Diagnostic: seconds of the audio the game hands over (6 channels, before the "
++                     "driver) saved to audio_volcado_<client>.wav next to the executable; "
++                     "0 = none");
+ REXCVAR_DEFINE_INT32(audio_volcado_desde_s, 0, "Audio",
+-                     "Diagnostico: segundos de audio de cada cliente que se saltan antes del volcado");
++                     "Diagnostic: seconds of each client's audio skipped before the dump");
+ 
+ namespace {
+ 
+@@ -112,7 +112,7 @@ void EscribirVolcado(uint32_t cliente, std::vector<float> muestras) {
+                       ("audio_volcado_" + std::to_string(cliente) + ".wav");
+     std::ofstream fichero(ruta, std::ios::binary | std::ios::trunc);
+     if (!fichero) {
+-      REXKRNL_WARN("[audio] no se pudo crear el volcado {}", ruta.string());
++      REXKRNL_WARN("[audio] could not create the dump {}", ruta.string());
+       return;
+     }
+     const uint32_t bytes = uint32_t(muestras.size() * sizeof(float));
+@@ -131,7 +131,7 @@ void EscribirVolcado(uint32_t cliente, std::vector<float> muestras) {
+     fichero.write("data", 4);
+     u32(bytes);
+     fichero.write(reinterpret_cast<const char*>(muestras.data()), bytes);
+-    REXKRNL_INFO("[audio] volcado del cliente {}: {} muestras por canal en {}", cliente,
++    REXKRNL_INFO("[audio] dump of client {}: {} samples per channel in {}", cliente,
+                  muestras.size() / 6, ruta.string());
+   });
+ }
+diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index d8fac47..22cb126 100644
+--- a/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -52,9 +52,9 @@
+  * A monotonic clock read per call is a few nanoseconds next to a trip to the SD. It is on.
+  */
+ REXCVAR_DEFINE_INT32(nfsmw_io_aviso_ms, 8, "Filesystem",
+-                     "Avisa en el log de cada apertura o lectura que pase de estos ms (0 = nunca).");
++                     "Logs every open or read that takes longer than this many ms (0 = never).");
+ REXCVAR_DEFINE_INT32(nfsmw_io_resumen_s, 15, "Filesystem",
+-                     "Cada cuantos segundos se escribe el resumen [io] (0 = nunca).");
++                     "How often, in seconds, the [io] summary is written (0 = never).");
+ 
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+@@ -266,15 +266,15 @@ void QuizaResumenIo(uint64_t ahora_us) {
+   const uint64_t aperturas = d.aperturas_ok + d.aperturas_fallo;
+ 
+   REXKRNL_INFO(
+-      "[io] {} s: {} aperturas ({} fallan) {:.1f} ms en total, peor {:.1f} ms, media {:.2f} ms; "
+-      "{} lecturas {:.1f} MB en {:.1f} ms, peor {:.1f} ms",
++      "[io] {} s: {} opens ({} fail) {:.1f} ms in total, worst {:.1f} ms, mean {:.2f} ms; "
++      "{} reads {:.1f} MB in {:.1f} ms, worst {:.1f} ms",
+       periodo_s, aperturas, d.aperturas_fallo, d.us_aperturas / 1000.0, peor_abrir / 1000.0,
+       aperturas ? (d.us_aperturas / 1000.0) / double(aperturas) : 0.0, d.lecturas,
+       d.bytes_leidos / (1024.0 * 1024.0), d.us_lecturas / 1000.0, peor_leer / 1000.0);
+   REXKRNL_INFO(
+-      "[io] rutas: {} resueltas sin tocar la SD, {} stats, {} barridos de directorio ({} entradas "
+-      "en el arbol); ventana: {} aciertos / {} rellenos / {} directas, {:.1f} MB desde RAM, {} "
+-      "ficheros con ventana",
++      "[io] paths: {} resolved without touching the SD, {} stats, {} directory scans ({} entries "
++      "in the tree); read-ahead: {} hits / {} fills / {} direct, {:.1f} MB from RAM, {} "
++      "files with read-ahead",
+       d.misses_en_seco, d.stats_en_sd, d.barridos_en_sd, rutas.entradas_en_arbol, d.aciertos,
+       d.rellenos, d.directas, d.bytes_ram / (1024.0 * 1024.0), ventana.ventanas_vivas);
+ 
+@@ -289,8 +289,8 @@ void QuizaResumenIo(uint64_t ahora_us) {
+    */
+   const uint64_t lecturas_tramo = d.relecturas + d.distintos;
+   REXKRNL_INFO(
+-      "[io] rangos: {} releidas de {} ({:.0f} %), {:.1f} MB ya leidos antes de {:.1f} MB ({:.0f} %); {} "
+-      "seguidas ({:.0f} %); {} desalojos",
++      "[io] ranges: {} reread of {} ({:.0f} %), {:.1f} MB read before of {:.1f} MB ({:.0f} %); {} "
++      "sequential ({:.0f} %); {} evictions",
+       d.relecturas, lecturas_tramo,
+       lecturas_tramo ? 100.0 * double(d.relecturas) / double(lecturas_tramo) : 0.0,
+       d.bytes_relectura / (1024.0 * 1024.0),
+@@ -319,15 +319,15 @@ void QuizaResumenIo(uint64_t ahora_us) {
+   const auto rangos = rex::filesystem::LeerEstadisticasRangos();
+   const uint64_t rangos_total = rangos.aciertos + rangos.fallos;
+   REXKRNL_INFO(
+-      "[io] rangos-cache: {} aciertos / {} fallos ({:.0f} %), {:.1f} MB desde RAM contra {:.1f} MB "
+-      "de la SD; {} entradas vivas ({:.1f} MB de {} tope), {} expulsiones; no cacheadas: {} bajo el "
+-      "suelo de {} KB, {} sobre el techo, {} del barrido de carga ({:.1f} MB){}",
++      "[io] range cache: {} hits / {} misses ({:.0f} %), {:.1f} MB from RAM against {:.1f} MB "
++      "from the SD; {} live entries ({:.1f} MB of {} cap), {} evictions; not cached: {} under the "
++      "floor of {} KB, {} over the ceiling, {} from the loading sweep ({:.1f} MB){}",
+       rangos.aciertos, rangos.fallos,
+       rangos_total ? 100.0 * double(rangos.aciertos) / double(rangos_total) : 0.0,
+       rangos.bytes_ram / (1024.0 * 1024.0), rangos.bytes_disco / (1024.0 * 1024.0), rangos.entradas,
+       rangos.bytes_vivos / (1024.0 * 1024.0), rangos.tope_mb, rangos.expulsiones, rangos.bajo_suelo,
+       rangos.suelo_kb, rangos.sobre_techo, rangos.secuenciales,
+-      rangos.secuenciales_bytes / (1024.0 * 1024.0), rangos.sin_memoria ? " [APAGADA: sin memoria]" : "");
++      rangos.secuenciales_bytes / (1024.0 * 1024.0), rangos.sin_memoria ? " [OFF: out of memory]" : "");
+ }
+ 
+ // Always measured: reading the monotonic clock on Horizon is a processor register read, not a system call.
+@@ -390,7 +390,7 @@ void NfsmwAnotarApertura(const rex::filesystem::Entry* entrada, const std::strin
+     g_nfsmw_wmv_abiertos.erase(g_nfsmw_wmv_abiertos.begin());
+   }
+   g_nfsmw_wmv_abiertos.emplace_back(entrada, ruta);
+-  REXLOG_INFO("[video] el juego abre '{}'", ruta);
++  REXLOG_INFO("[video] the game opens '{}'", ruta);
+ }
+ 
+ void NfsmwAnotarLectura(const rex::filesystem::Entry* entrada) {
+@@ -399,7 +399,7 @@ void NfsmwAnotarLectura(const rex::filesystem::Entry* entrada) {
+     if (e == entrada) {
+       if (r != g_nfsmw_ultimo_wmv_leido) {
+         g_nfsmw_ultimo_wmv_leido = r;
+-        REXLOG_INFO("[video] el juego lee '{}'", r);
++        REXLOG_INFO("[video] the game reads '{}'", r);
+       }
+       return;
+     }
+@@ -1055,7 +1055,7 @@ u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_st
+     result = file->Flush();
+     static std::atomic<uint32_t> avisos{0};
+     if (avisos.fetch_add(1, std::memory_order_relaxed) < 16) {
+-      REXKRNL_INFO("[guardado] NtFlushBuffersFile: {} bajado al disco (resultado {:08X})",
++      REXKRNL_INFO("[save] NtFlushBuffersFile: {} flushed to disk (result {:08X})",
+                    file->path(), uint32_t(result));
+     }
+   }
+diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..8e193cd 100644
+--- a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -1536,11 +1536,23 @@ REX_EXPORT_STUB(__imp__KeIpiGenericCall);
+ REX_EXPORT_STUB(__imp__KeQueryBackgroundProcessors);
+ REX_EXPORT_STUB(__imp__KeQueryInterruptTime);
+ REX_EXPORT_STUB(__imp__KeRegisterDriverNotification);
+-REX_EXPORT_STUB(__imp__KeRestoreFloatingPointState);
++// LEGO Batman port: silent no-op (as Xenia). The game's GPU interrupt handler calls it on every interrupt; the
++// logged stub filled the async log queue and blocked the GPU command thread on it.
++extern "C" REX_FUNC(__imp__KeRestoreFloatingPointState) {
++  (void)base;
++  ctx.r3.u64 = 0;
++}
++static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KeRestoreFloatingPointState("__imp__KeRestoreFloatingPointState", &__imp__KeRestoreFloatingPointState);
+ REX_EXPORT_STUB(__imp__KeRestoreVectorUnitState);
+ REX_EXPORT_STUB(__imp__KeRetireDpcList);
+ REX_EXPORT_STUB(__imp__KeRundownQueue);
+-REX_EXPORT_STUB(__imp__KeSaveFloatingPointState);
++// LEGO Batman port: silent no-op (as Xenia). The game's GPU interrupt handler calls it on every interrupt; the
++// logged stub filled the async log queue and blocked the GPU command thread on it.
++extern "C" REX_FUNC(__imp__KeSaveFloatingPointState) {
++  (void)base;
++  ctx.r3.u64 = 0;
++}
++static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KeSaveFloatingPointState("__imp__KeSaveFloatingPointState", &__imp__KeSaveFloatingPointState);
+ REX_EXPORT_STUB(__imp__KeSaveVectorUnitState);
+ REX_EXPORT_STUB(__imp__KeSetBackgroundProcessors);
+ REX_EXPORT_STUB(__imp__KeSetPriorityClassThread);
+diff --git a/sdk/src/system/util/object_table.cpp b/sdk/src/system/util/object_table.cpp
+index 6fbabd2..e0021e4 100644
+--- a/sdk/src/system/util/object_table.cpp
++++ b/sdk/src/system/util/object_table.cpp
+@@ -275,7 +275,7 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
+ 
+   XObject* object = nullptr;
+   if (!already_locked) {
+-    global_critical_region_.mutex().lock();
++    rex::thread::LockAdaptive(global_critical_region_.mutex());  // hot: NtSetEvent etc.
+   }
+ 
+   // Lower 2 bits are ignored.
+diff --git a/sdk/src/system/xam/content_manager.cpp b/sdk/src/system/xam/content_manager.cpp
+index 78826a6..8a5598d 100644
+--- a/sdk/src/system/xam/content_manager.cpp
++++ b/sdk/src/system/xam/content_manager.cpp
+@@ -46,8 +46,8 @@
+  *     version to recover a profile that got corrupted.
+  */
+ REXCVAR_DEFINE_STRING(content_backup_root, "", "Kernel",
+-                      "Carpeta donde dejar una copia de cada guardado, con una subcarpeta por perfil. "
+-                      "Vacia = no se copia nada");
++                      "Folder for a copy of every save, with a subfolder per profile. "
++                      "Empty = no copies");
+ 
+ namespace rex {
+ namespace system {
+@@ -101,9 +101,9 @@ std::string QueHayDentro(const std::filesystem::path& carpeta) {
+     ++cuantos;
+   }
+   if (cuantos == 0) {
+-    return "VACIO";
++    return "EMPTY";
+   }
+-  return fmt::format("{} fichero(s), {} B: {}", cuantos, total, texto);
++  return fmt::format("{} file(s), {} B: {}", cuantos, total, texto);
+ }
+ 
+ bool CopiarFichero(const std::filesystem::path& origen, const std::filesystem::path& destino) {
+@@ -186,10 +186,10 @@ void CopiaParaElUsuario(const std::string_view nombre, const std::filesystem::pa
+   uint32_t ficheros = 0;
+   const bool bien = CopiarCarpeta(origen, actual, ficheros);
+   if (bien) {
+-    REXSYS_INFO("[guardado] copia de «{}»: {} fichero(s) en {}", perfil, ficheros,
++    REXSYS_INFO("[save] copy of '{}': {} file(s) in {}", perfil, ficheros,
+                 rex::path_to_utf8(actual));
+   } else {
+-    REXSYS_WARN("[guardado] la copia de «{}» ha fallado a medias ({} fichero(s) en {})", perfil,
++    REXSYS_WARN("[save] the copy of '{}' failed partway ({} file(s) in {})", perfil,
+                 ficheros, rex::path_to_utf8(actual));
+   }
+ }
+@@ -331,10 +331,10 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+   // What the game sees when it asks for the list of saves. If a profile that exists on disk does not show
+   // up here, the problem is the enumeration; if it shows up and is then reported as damaged, the problem
+   // is its contents.
+-  REXSYS_INFO("[guardado] listar tipo {:08X} en {}: {} entrada(s)", uint32_t(content_type),
++  REXSYS_INFO("[save] list type {:08X} in {}: {} entry(ies)", uint32_t(content_type),
+               rex::path_to_utf8(package_root), result.size());
+   for (const auto& entrada : result) {
+-    REXSYS_INFO("[guardado]   «{}» (mostrado como «{}»)", entrada.file_name(),
++    REXSYS_INFO("[save]   '{}' (shown as '{}')", entrada.file_name(),
+                 rex::string::to_utf8(entrada.display_name()));
+   }
+ 
+@@ -387,8 +387,8 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
+     fwrite(&license_mask, 1, sizeof(license_mask), file);
+   }
+   const bool bien = fclose(file) == 0;
+-  REXSYS_INFO("[guardado] cabecera de «{}» {} en {}", data.file_name(),
+-              bien ? "escrita" : "FALLO al cerrarse", rex::path_to_utf8(header_path));
++  REXSYS_INFO("[save] header of '{}' {} in {}", data.file_name(),
++              bien ? "written" : "FAILED on close", rex::path_to_utf8(header_path));
+   return X_ERROR_SUCCESS;
+ }
+ 
+@@ -435,14 +435,14 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
+   }
+ 
+   auto package_path = ResolvePackagePath(xuid, data);
+-  REXSYS_INFO("[guardado] crear «{}» (raiz {}) en {}", data.file_name(), root_name,
++  REXSYS_INFO("[save] create '{}' (root {}) in {}", data.file_name(), root_name,
+               rex::path_to_utf8(package_path));
+   if (std::filesystem::exists(package_path)) {
+-    REXSYS_WARN("[guardado] crear «{}»: ya existia, se devuelve ALREADY_EXISTS", data.file_name());
++    REXSYS_WARN("[save] create '{}': already existed, returning ALREADY_EXISTS", data.file_name());
+     return X_ERROR_ALREADY_EXISTS;
+   }
+   if (!std::filesystem::create_directories(package_path)) {
+-    REXSYS_ERROR("[guardado] crear «{}»: NO se ha podido crear {}", data.file_name(),
++    REXSYS_ERROR("[save] create '{}': could NOT create {}", data.file_name(),
+                  rex::path_to_utf8(package_path));
+     return X_ERROR_ACCESS_DENIED;
+   }
+@@ -471,14 +471,14 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
+ 
+   auto package_path = ResolvePackagePath(xuid, data);
+   if (!std::filesystem::exists(package_path)) {
+-    REXSYS_WARN("[guardado] abrir «{}»: no existe {}", data.file_name(),
++    REXSYS_WARN("[save] open '{}': {} does not exist", data.file_name(),
+                 rex::path_to_utf8(package_path));
+     return X_ERROR_FILE_NOT_FOUND;
+   }
+   // What the game will find inside. If this says VACIO and the profile is then reported as damaged, the
+   // failure was in saving; if it lists the files with their sizes, the failure is in reading them or in
+   // the contents themselves.
+-  REXSYS_INFO("[guardado] abrir «{}» (raiz {}) en {} -> {}", data.file_name(), root_name,
++  REXSYS_INFO("[save] open '{}' (root {}) in {} -> {}", data.file_name(), root_name,
+               rex::path_to_utf8(package_path), QueHayDentro(package_path));
+   auto package = ResolvePackage(root_name, xuid, data);
+   assert_not_null(package);
+@@ -512,7 +512,7 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
+   const std::string nombre = package->GetPackageContentData().file_name();
+   delete package;  // unmounts the guest drive: from here on the files are in place
+ 
+-  REXSYS_INFO("[guardado] cerrar «{}» (raiz {}) en {} -> {}", nombre, root_name,
++  REXSYS_INFO("[save] close '{}' (root {}) in {} -> {}", nombre, root_name,
+               rex::path_to_utf8(ruta), QueHayDentro(ruta));
+   CopiaParaElUsuario(nombre, ruta);
+   return X_ERROR_SUCCESS;
+diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
+index af02bc0..c2903c0 100644
+--- a/sdk/src/system/xthread.cpp
++++ b/sdk/src/system/xthread.cpp
+@@ -350,7 +350,7 @@ int SwitchPriorityFor(bool guest_thread, std::string_view name) {
+   // set_name() stores the name with the handle appended ("Audio Worker (F8000014)"),
+   // so the prefix is compared. With an exact comparison the Audio Worker and the
+   // XMA Decoder stayed at the presentation priority (0x2C) instead of the audio one
+-  // (0x2B), as rex_perfil.log showed on the console.
++  // (0x2B), as rex_profile.log showed on the console.
+   if (name.starts_with("Audio Worker") || name.starts_with("XMA Decoder")) {
+     return REX_SWITCH_PRIO_AUDIO;
+   }
+diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
+index b4c89f1..c8e5fdb 100644
+--- a/sdk/src/ui/presenter.cpp
++++ b/sdk/src/ui/presenter.cpp
+@@ -54,9 +54,9 @@ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+  * when this was measured, so it never waits for a vblank.
+  */
+ REXCVAR_DEFINE_BOOL(host_present_ignore_implicit_vsync, true, "UI/Presenter",
+-                    "Presentar desde el hilo del juego aunque la superficie tenga vsync implicito "
+-                    "(FIFO). Sin esto, con FIFO se pinta en el hilo de la interfaz y el buzon tira "
+-                    "la mitad de los fotogramas");
++                    "Present from the game thread even when the surface has implicit vsync "
++                    "(FIFO). Without this, FIFO paints on the UI thread and the mailbox drops "
++                    "half of the frames");
+ 
+ #if REX_PLATFORM_SWITCH
+ // Off by default. See the long comment below: it lowers the mean and blows up the variance, and
+@@ -90,13 +90,13 @@ REXCVAR_DEFINE_BOOL(host_present_ignore_implicit_vsync, true, "UI/Presenter",
+  *
+  * Not deleted: the mechanism works, it is measured and the switch is still there. It would only pay off
+  * if presenting cost the recording thread nothing, and that needs a separate Vulkan queue, not another
+- * priority tweak (the priority is already applied: "aceptada por el kernel"). The device has a single
++ * priority tweak (the priority is already applied: "accepted by the kernel"). The device has a single
+  * queue (see docs/platform-notes.md, Presentation).
+  */
+ REXCVAR_DEFINE_BOOL(present_hilo_propio, REX_PRESENT_HILO_PROPIO_DEFAULT, "UI/Presenter",
+-                    "Presentar en un hilo propio del presentador en vez de dentro del hilo que "
+-                    "genera la imagen. El hilo del juego solo marca que hay imagen nueva y sigue "
+-                    "grabando, asi que la GPU no se queda sin trabajo mientras se presenta")
++                    "Present on a thread of the presenter's own instead of inside the thread that "
++                    "renders the image. The game thread only flags a new image and keeps "
++                    "recording, so the GPU does not run out of work while presenting")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ /*
+@@ -104,34 +104,34 @@ REXCVAR_DEFINE_BOOL(present_hilo_propio, REX_PRESENT_HILO_PROPIO_DEFAULT, "UI/Pr
+  * over 50 ms went from 8.20 % to 47.52 %. Steady beats fast.
+  */
+ REXCVAR_DEFINE_BOOL(present_hilo_sin_descartes, true, "UI/Presenter",
+-                    "El hilo que genera la imagen espera a que el presentador coja el fotograma "
+-                    "anterior en vez de tirarlo. Con el presentador sobrado no espera nunca; si va "
+-                    "justo, frena el juego a su ritmo, que es REGULAR. En false se vuelve al "
+-                    "comportamiento de la 113: mas FPS nominales y muchisimo mas stuttering");
++                    "The thread that renders the image waits for the presenter to take the previous "
++                    "frame instead of dropping it. With a presenter to spare it never waits; when it "
++                    "is tight, it slows the game to its pace, which is STEADY. false goes back to "
++                    "build 113's behaviour: more nominal FPS and much more stuttering");
+ 
+ REXCVAR_DEFINE_INT32(present_hilo_espera_max_ms, 50, "UI/Presenter",
+-                     "Plazo maximo de esa espera, en ms. Es una red de seguridad por si el "
+-                     "presentador se colgara, no un mecanismo: al agotarse se descarta como antes. "
+-                     "0 = esperar sin plazo");
++                     "Longest wait for that, in ms. A safety net in case the presenter "
++                     "hangs, not a mechanism: when it runs out the frame is dropped as before. "
++                     "0 = wait without a limit");
+ 
+ REXCVAR_DEFINE_INT32(present_hilo_ventana, 600, "UI/Presenter",
+-                     "Fotogramas de la ventana con la que se juzga si el hilo de presentacion da "
+-                     "abasto. Se mira la espera MEDIA, no las rachas: en la compilacion 115 el juego "
+-                     "esperaba el 43 % de los fotogramas pero nunca 90 seguidos, asi que el seguro "
+-                     "por rachas no salto y el stuttering subio del 4,93 % al 6,61 %");
++                     "Frames in the window used to judge whether the present thread keeps "
++                     "up. It looks at the AVERAGE wait, not streaks: in build 115 the game "
++                     "waited in 43 % of frames but never 90 in a row, so the streak guard "
++                     "never tripped and stuttering went from 4.93 % to 6.61 %");
+ 
+ REXCVAR_DEFINE_INT32(present_hilo_espera_media_max_us, 1500, "UI/Presenter",
+-                     "Microsegundos que puede costarle de media el presentador al juego, por "
+-                     "fotograma, antes de apagar el hilo propio. 1500 = 1,5 ms sobre un fotograma de "
+-                     "~38: por encima de eso el hilo propio quita menos de lo que mete. En la 115 "
+-                     "iban 5,2 ms de media por fotograma (12,07 ms en el 43 % de ellos)");
++                     "Microseconds the presenter may cost the game on average, per "
++                     "frame, before its own thread is turned off. 1500 = 1.5 ms of a ~38 ms "
++                     "frame: above that the thread costs more than it saves. Build 115 "
++                     "averaged 5.2 ms per frame (12.07 ms in 43 % of them)");
+ 
+ 
+ REXCVAR_DEFINE_INT32(present_hilo_gracia_fotogramas, 3000, "UI/Presenter",
+-                     "Fotogramas de gracia antes de que la rendicion pueda dispararse. Durante el "
+-                     "arranque y las cargas los tres nucleos estan saturados y el presentador llega "
+-                     "tarde por motivos que no se repiten en carrera; en la compilacion 114 se rindio "
+-                     "a los 34 segundos por eso y la carrera entera fue por el camino viejo");
++                     "Grace frames before giving up can trigger. During "
++                     "startup and loading the three cores are saturated and the presenter is late "
++                     "for reasons that do not recur in play; build 114 gave up "
++                     "after 34 seconds because of that and the whole race took the old path");
+ 
+ /*
+  * Horizon priority of the new thread. 0x2C is REX_SWITCH_PRIO_PRESENT, the band the SDK itself reserves
+@@ -147,8 +147,8 @@ REXCVAR_DEFINE_INT32(present_hilo_gracia_fotogramas, 3000, "UI/Presenter",
+  *     on fences, not using CPU.
+  */
+ REXCVAR_DEFINE_INT32(present_hilo_prioridad, 0x2C, "UI/Presenter",
+-                     "Prioridad de Horizon del hilo de presentacion (0x1C-0x3B). 0x2C por defecto "
+-                     "(REX_SWITCH_PRIO_PRESENT). Sin efecto fuera de la Switch");
++                     "Horizon priority of the present thread (0x1C-0x3B). 0x2C by default "
++                     "(REX_SWITCH_PRIO_PRESENT). No effect outside the Switch");
+ 
+ REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
+                     "Enable letterboxing for non-native aspect ratios");
+@@ -1438,12 +1438,12 @@ void Presenter::SetPaintModeFromUIThread(PaintMode new_mode) {
+     return;
+   }
+   // Say it in the log. Whether every rendered frame reaches the screen depends on this.
+-  REXLOG_INFO("Presenter: modo de pintado -> {} (vsync implicito {}, dibujantes de interfaz {})",
++  REXLOG_INFO("Presenter: paint mode -> {} (implicit vsync {}, UI drawers {})",
+               new_mode == PaintMode::kGuestOutputThreadImmediately
+-                  ? "desde el hilo del juego, presentando en el acto"
+-                  : (new_mode == PaintMode::kUIThreadOnRequest ? "en el hilo de la interfaz, a peticion"
+-                                                               : "ninguno"),
+-              surface_paint_connection_has_implicit_vsync_ ? "si" : "no", ui_drawers_.size());
++                  ? "from the game thread, presenting immediately"
++                  : (new_mode == PaintMode::kUIThreadOnRequest ? "on the UI thread, on request"
++                                                               : "none"),
++              surface_paint_connection_has_implicit_vsync_ ? "yes" : "no", ui_drawers_.size());
+   // The own thread is started before the mode is announced, so the game thread never sees
+   // kGuestOutputThreadImmediately with the thread half set up.
+   if (new_mode == PaintMode::kGuestOutputThreadImmediately) {
+@@ -1691,14 +1691,14 @@ void Presenter::StartPaintThreadFromUIThread() {
+   if (!paint_thread_) {
+     // Not fatal: without the thread, painting keeps happening inside the game thread, as always.
+     REXLOG_WARN(
+-        "Presenter: no se pudo crear el hilo de presentacion; se presenta en el hilo del juego");
++        "Presenter: could not create the present thread; presenting on the game thread");
+     return;
+   }
+   paint_thread_->set_name("Presenter Paint");
+   paint_thread_activo_.store(true, std::memory_order_release);
+   REXLOG_INFO(
+-      "Presenter: hilo de presentacion propio en marcha (prioridad de Horizon {:#x}). El hilo que "
+-      "genera la imagen ya no se bloquea presentando",
++      "Presenter: own present thread running (Horizon priority {:#x}). The thread that "
++      "renders the image no longer blocks on presenting",
+       uint32_t(REXCVAR_GET(present_hilo_prioridad)));
+ }
+ 
+@@ -1718,7 +1718,7 @@ void Presenter::ShutdownPaintThread() {
+   }
+   rex::thread::Wait(paint_thread_.get(), false);
+   paint_thread_.reset();
+-  REXLOG_INFO("Presenter: hilo de presentacion parado ({} avisos, {} pintados, {} descartados)",
++  REXLOG_INFO("Presenter: present thread stopped ({} signals, {} painted, {} dropped)",
+               paint_thread_avisos_, paint_thread_pintados_, paint_thread_descartados_);
+ }
+ 
+@@ -1834,15 +1834,15 @@ void Presenter::RequestPaintFromPaintThread() {
+   // The log, outside the lock.
+   if (rendirse && paint_thread_activo_.exchange(false)) {
+     REXLOG_WARN(
+-        "[presentador] el hilo propio no da abasto: el juego lleva esperandole {:.2f} ms de media por "
+-        "fotograma, por encima del limite. Se apaga y se vuelve a presentar desde el hilo del juego, "
+-        "que es lo que hacia la compilacion 114: menos FPS, pero mas liso",
++        "[presenter] the own thread cannot keep up: the game has waited for it {:.2f} ms on average per "
++        "frame, over the limit. Turning it off and presenting from the game thread again, "
++        "as build 114 did: fewer FPS, but smoother",
+         paint_thread_espera_media_us_ / 1000.0);
+   }
+   if (avisos % 600 == 0) {
+     REXLOG_INFO(
+-        "[presentador] hilo propio: {} fotogramas avisados, {} presentados, {} descartados ({:.1f} %); "
+-        "el juego espero al presentador {} veces, {:.2f} ms de media",
++        "[presenter] own thread: {} frames signalled, {} presented, {} dropped ({:.1f} %); "
++        "the game waited for the presenter {} times, {:.2f} ms on average",
+         avisos, pintados, descartados, 100.0 * double(descartados) / double(avisos), esperas,
+         esperas ? double(espera_ns) / 1e6 / double(esperas) : 0.0);
+   }
+@@ -1895,10 +1895,10 @@ void Presenter::PaintThreadMain() {
+      * explain the 18-22 ms it took to record a quad.
+      */
+     const bool ok = RexSwitchSetCurrentThreadPriorityOk(prioridad);
+-    REXLOG_INFO("[presentador] prioridad de Horizon {:#x}: {}", uint32_t(prioridad),
+-                ok ? "aceptada por el kernel" : "*** RECHAZADA: el hilo se queda con la de serie ***");
++    REXLOG_INFO("[presenter] Horizon priority {:#x}: {}", uint32_t(prioridad),
++                ok ? "accepted by the kernel" : "*** REJECTED: the thread keeps the default ***");
+   } else {
+-    REXLOG_WARN("Presenter: present_hilo_prioridad = {} fuera de 0x1C-0x3B: se deja la de serie",
++    REXLOG_WARN("Presenter: present_hilo_prioridad = {} outside 0x1C-0x3B: keeping the default",
+                 prioridad);
+   }
+ #endif
+diff --git a/sdk/src/ui/runtime_switch.cpp b/sdk/src/ui/runtime_switch.cpp
+index ba4fbc8..022c20e 100644
+--- a/sdk/src/ui/runtime_switch.cpp
++++ b/sdk/src/ui/runtime_switch.cpp
+@@ -36,7 +36,7 @@ namespace {
+  * errors what() includes the path. It ends with error 2345-0104.
+  */
+ [[noreturn]] void RexSwitchTerminate() {
+-  char reason[768] = "std::terminate sin excepcion activa";
++  char reason[768] = "std::terminate without an active exception";
+   if (std::exception_ptr current = std::current_exception()) {
+     const std::type_info* type = abi::__cxa_current_exception_type();
+     int status = -1;
+diff --git a/sdk/src/ui/switch_apm.cpp b/sdk/src/ui/switch_apm.cpp
+index b71ce09..c0c6f29 100644
+--- a/sdk/src/ui/switch_apm.cpp
++++ b/sdk/src/ui/switch_apm.cpp
+@@ -221,11 +221,11 @@ extern "C" void RexSwitchApmAplicar(void) {
+ 
+   ApmPerformanceMode modo = ApmPerformanceMode_Invalid;
+   if (R_FAILED(apmGetPerformanceMode(&modo))) {
+-    std::fprintf(stderr, "[apm] no se pudo leer el modo de rendimiento; no se toca nada\n");
++    std::fprintf(stderr, "[apm] could not read the performance mode; changing nothing\n");
+     return;
+   }
+   if (modo != ApmPerformanceMode_Normal) {
+-    std::fprintf(stderr, "[apm] la consola esta en sobremesa (modo %d): no se pide nada\n", int(modo));
++    std::fprintf(stderr, "[apm] the console is docked (mode %d): requesting nothing\n", int(modo));
+     return;
+   }
+ 
+@@ -235,11 +235,11 @@ extern "C" void RexSwitchApmAplicar(void) {
+   u32 gpu0 = 0, emc0 = 0;
+   if (!LeerRelojes(gpu0, emc0)) {
+     std::fprintf(stderr,
+-                 "[apm] no se pueden leer los relojes reales (clkrst): NO se cambia nada, porque sin "
+-                 "comprobar no se puede garantizar que la memoria se quede donde esta\n");
++                 "[apm] cannot read the real clocks (clkrst): changing NOTHING, because without "
++                 "checking there is no guarantee the memory clock stays where it is\n");
+     return;
+   }
+-  std::fprintf(stderr, "[apm] de partida: config 0x%08X, GPU %.1f MHz, memoria %.1f MHz\n",
++  std::fprintf(stderr, "[apm] at start: config 0x%08X, GPU %.1f MHz, memory %.1f MHz\n",
+                hay_original ? config_original : 0u, double(gpu0) / 1e6, double(emc0) / 1e6);
+ 
+   const u32 objetivo_gpu_hz = u32(mhz) * 1000000u;
+@@ -264,10 +264,10 @@ extern "C" void RexSwitchApmAplicar(void) {
+     if (gpu_subio && memoria_quieta) {
+       if (!quieta_de_verdad) {
+         std::fprintf(stderr,
+-                     "[apm] 0x%08X sube la memoria a %.1f MHz, pero nfsmw_switch_ram_1600 esta en "
+-                     "true: se acepta y NO se vigila la memoria\n",
++                     "[apm] 0x%08X raises the memory to %.1f MHz, but nfsmw_switch_ram_1600 is "
++                     "true: accepted, and the memory is NOT watched\n",
+                      c.config, double(emc1) / 1e6);
+-        std::fprintf(stderr, "[apm] PUESTA 0x%08X: GPU %.1f MHz (era %.1f), memoria %.1f MHz\n",
++        std::fprintf(stderr, "[apm] SET 0x%08X: GPU %.1f MHz (was %.1f), memory %.1f MHz\n",
+                      c.config, double(gpu1) / 1e6, double(gpu0) / 1e6, double(emc1) / 1e6);
+         return;  // watchdog not armed: lowering it would fight what the cvar asks for
+       }
+@@ -277,16 +277,16 @@ extern "C" void RexSwitchApmAplicar(void) {
+        */
+       g_emc_original.store(emc0, std::memory_order_relaxed);
+       std::fprintf(stderr,
+-                   "[apm] PUESTA la configuracion 0x%08X (tabla: GPU %d, EMC %d): GPU %.1f MHz (era "
+-                   "%.1f) y la memoria se queda en %.1f MHz, comprobada durante %.1f s seguidos; "
+-                   "queda vigilada\n",
++                   "[apm] SET configuration 0x%08X (table: GPU %d, EMC %d): GPU %.1f MHz (was "
++                   "%.1f) and the memory stays at %.1f MHz, checked for %.1f s in a row; "
++                   "now watched\n",
+                    c.config, c.mhz, c.emc, double(gpu1) / 1e6, double(gpu0) / 1e6,
+                    double(emc1) / 1e6, double(kSondeoPasoNs) * kSondeoPasos / 1e9);
+       return;
+     }
+-    std::fprintf(stderr, "[apm] descartada 0x%08X: GPU %.1f MHz, memoria %.1f MHz (%s)\n", c.config,
++    std::fprintf(stderr, "[apm] rejected 0x%08X: GPU %.1f MHz, memory %.1f MHz (%s)\n", c.config,
+                  double(gpu1) / 1e6, double(emc1) / 1e6,
+-                 !gpu_subio ? "la GPU no sube lo pedido" : "MUEVE LA MEMORIA");
++                 !gpu_subio ? "the GPU does not reach the request" : "IT MOVES THE MEMORY CLOCK");
+   }
+ 
+   /*
+@@ -301,14 +301,14 @@ extern "C" void RexSwitchApmAplicar(void) {
+     u32 gpu2 = 0, emc2 = 0;
+     MemoriaQuietaDurante(emc0, gpu2, emc2);
+     std::fprintf(stderr,
+-                 "[apm] este firmware NO tiene ninguna configuracion de %d MHz que deje la memoria "
+-                 "en %.1f MHz; se vuelve a la original 0x%08X (GPU %.1f MHz, memoria %.1f MHz).\n"
+-                 "[apm] SI PREFIERES LA GPU ALTA AUNQUE LA RAM SUBA A 1600: pon "
+-                 "nfsmw_switch_ram_1600 = true en nfsmw.toml\n",
++                 "[apm] this firmware has NO %d MHz configuration that keeps the memory "
++                 "at %.1f MHz; back to the original 0x%08X (GPU %.1f MHz, memory %.1f MHz).\n"
++                 "[apm] IF YOU PREFER THE HIGHER GPU CLOCK EVEN WITH RAM AT 1600: set "
++                 "nfsmw_switch_ram_1600 = true in the config file\n",
+                  mhz, double(emc0) / 1e6, config_original, double(gpu2) / 1e6, double(emc2) / 1e6);
+   } else {
+-    std::fprintf(stderr, "[apm] ninguna configuracion de %d MHz sirvio y NO se pudo restaurar la "
+-                         "original: revisa los relojes en el overlay\n",
++    std::fprintf(stderr, "[apm] no %d MHz configuration worked and the original could NOT be "
++                         "restored: check the clocks in the overlay\n",
+                  mhz);
+   }
+ }
+@@ -334,15 +334,15 @@ extern "C" void RexSwitchApmVigilar(void) {
+   const int n = g_correcciones_emc.fetch_add(1, std::memory_order_relaxed) + 1;
+   if (!g_aviso_emc.exchange(true)) {
+     std::fprintf(stderr,
+-                 "[apm] la memoria habia subido sola a %.1f MHz (t=%d s): se baja a %.1f con clkrst "
++                 "[apm] the memory clock rose to %.1f MHz by itself (t=%d s): lowering it to %.1f with clkrst "
+                  "(%s)\n",
+-                 double(emc) / 1e6, tic, double(emc0) / 1e6, bajada ? "aceptado" : "RECHAZADO");
++                 double(emc) / 1e6, tic, double(emc0) / 1e6, bajada ? "accepted" : "REJECTED");
+   }
+   if (!bajada || n >= kMaxCorreccionesEmc) {
+     g_rendido_emc.store(true, std::memory_order_relaxed);
+     std::fprintf(stderr,
+-                 "[apm] se deja de insistir con la memoria tras %d intento(s): este firmware la "
+-                 "reimpone. La GPU se queda en lo pedido; la RAM, en lo que mande el sistema\n",
++                 "[apm] giving up on the memory clock after %d attempt(s): this firmware "
++                 "reimposes it. The GPU stays at the request; the RAM at what the system decides\n",
+                  n);
+   }
+ }
+diff --git a/sdk/src/ui/switch_crash_hooks.c b/sdk/src/ui/switch_crash_hooks.c
+index c3cc446..a022178 100644
+--- a/sdk/src/ui/switch_crash_hooks.c
++++ b/sdk/src/ui/switch_crash_hooks.c
+@@ -67,6 +67,17 @@ static void RexSwitchInitLogDir(void) {
+ 
+ void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump* ctx, u64 stack, u64 pc);
+ 
++/*
++ * LEGO Batman port: the game may define RexSwitchLogFiles() returning 0 (release builds): then stderr and the
++ * performance report (rex_profile.log) write no file. Crash and assert logs are still written when they happen.
++ * Weak, because the constructor below runs before any of the game's code could say so.
++ */
++__attribute__((weak)) int RexSwitchLogFiles(void);
++
++int RexSwitchLogFilesOn(void) {
++    return !RexSwitchLogFiles || RexSwitchLogFiles();
++}
++
+ void abort(void) {
+     RexSwitchCrashLog("abort()", NULL, (u64)__builtin_frame_address(0),
+                       (u64)__builtin_return_address(0));
+@@ -74,7 +85,7 @@ void abort(void) {
+ }
+ 
+ static void RexSwitchExitHook(void) {
+-    RexSwitchCrashLog("exit() fuera del cierre ordenado", NULL, (u64)__builtin_frame_address(0),
++    RexSwitchCrashLog("exit() outside the orderly shutdown", NULL, (u64)__builtin_frame_address(0),
+                       (u64)__builtin_return_address(0));
+     diagAbortWithResult(MAKERESULT(Module_Libnx, 103));
+ }
+@@ -89,7 +100,9 @@ static void RexSwitchCrashHooksInit(void) {
+     RexSwitchInitLogDir();
+     char ruta[FS_MAX_PATH];
+     snprintf(ruta, sizeof(ruta), "%srex_stderr.log", g_rex_log_dir);
+-    if (freopen(ruta, "w", stderr)) {
++    if (!RexSwitchLogFilesOn()) {
++        remove(ruta);  /* a stale one from a development build */
++    } else if (freopen(ruta, "w", stderr)) {
+         setvbuf(stderr, NULL, _IONBF, 0);
+     }
+     atexit(RexSwitchExitHook);
+diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
+index 6b3d30a..eeaec1c 100644
+--- a/sdk/src/ui/switch_perf.cpp
++++ b/sdk/src/ui/switch_perf.cpp
+@@ -6,7 +6,7 @@
+  * GPU at 99.7% according to the Horizon OC monitor. That does not tell what to optimize: it takes
+  * knowing which thread spends the CPU and in which function. Horizon has no perf and no debugger
+  * on a retail console, so it is measured from inside. Every 10 s a report is appended to
+- * <NRO folder>/logs/rex/rex_perfil.log:
++ * <NRO folder>/logs/rex/rex_profile.log:
+  *
+  *  - Game FPS: guest presents (IssueSwap).
+  *  - Faults per second by type: each one costs an exception, or two with the resume through the
+@@ -92,9 +92,14 @@ std::atomic<uint32_t> g_resolucion{(1280u << 16) | 720u};
+ constexpr u64 kPassiveIntervalNs = 100000000ULL;  // 100 ms, without pausing threads
+ // Next to the rexglue logs, in <NRO folder>/logs/rex/.
+ std::string StackFlagPath() {
+-  return std::string(RexSwitchLogDir()) + "perfil_pilas.flag";
++  return std::string(RexSwitchLogDir()) + "profile_stacks.flag";
+ }
+ constexpr u64 kReportSeconds = 10;
++FILE* f_report_dummy = nullptr;
++// LEGO Batman port: the 10 s report to rex_profile.log can be turned off (release builds: RexSwitchPerfReports(0)).
++// The once-a-second FPS/resolution for the console overlay keeps running.
++std::atomic<bool> g_reports{true};
++extern "C" int RexSwitchLogFilesOn(void);  // switch_crash_hooks.c: false in the game's release builds
+ /*
+  * Let the game start first. This only delays stack sampling and the first report, which read the
+  * SD and pause threads. The console overlays (FPS and resolution) are published from second zero:
+@@ -106,7 +111,7 @@ constexpr size_t kFrames = 10;
+ constexpr unsigned kCounterCount = 33;
+ // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
+ std::string ReportPath() {
+-  return std::string(RexSwitchLogDir()) + "rex_perfil.log";
++  return std::string(RexSwitchLogDir()) + "rex_profile.log";
+ }
+ 
+ struct Slot {
+@@ -131,7 +136,7 @@ struct Sample {
+ /*
+  * Long frame windows. The renderer calls RexSwitchPerfTiron with the interval of every frame over
+  * 45 ms; the report separates the samples taken inside those intervals and says what each thread was
+- * doing right then (section "durante los tirones"). Only works with perfil_pilas.flag.
++ * doing right then (section "during the stutters"). Only works with profile_stacks.flag.
+  */
+ constexpr size_t kMaxTirones = 256;
+ struct VentanaTiron {
+@@ -187,7 +192,7 @@ inline void Anotar(unsigned id, u64 desde, u64 bytes = 0) {
+ /*
+  * Automatic A/B tests. Each report (10 s) removes one part of the GPU work: those commands (draw or
+  * dispatch) stop being recorded, but everything else stays the same, so the state does not break.
+- * The image looks wrong while the mode lasts; that is expected. If with "sin nada" it is just as
++ * The image looks wrong while the mode lasts; that is expected. If with "nothing" it is just as
+  * slow, the cost is not in the work but in something fixed (submissions, driver).
+  */
+ struct Mode {
+@@ -196,13 +201,13 @@ struct Mode {
+ };
+ constexpr Mode kModes[] = {
+     {0, "normal"},
+-    {1, "sin dibujados"},
+-    {2, "sin transferencias"},
+-    {4, "sin resolves"},
+-    {8, "sin cargas de texturas"},
+-    {16, "sin efecto de presentacion"},
+-    {32, "sin despacho por baldosas"},
+-    {63, "sin nada"},
++    {1, "no draws"},
++    {2, "no transfers"},
++    {4, "no resolves"},
++    {8, "no texture uploads"},
++    {16, "no present effect"},
++    {32, "no tiled dispatch"},
++    {63, "nothing"},
+ };
+ constexpr size_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);
+ 
+@@ -217,7 +222,7 @@ constexpr size_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);
+  * the measurement is useful. From then on it removes one part of the GPU work per report, goes once
+  * through the eight modes and returns to "normal".
+  *
+- * How to read it. If with "sin nada" the game is just as slow, the cost is not in the GPU work but
++ * How to read it. If with "nothing" the game is just as slow, the cost is not in the GPU work but
+  * in something fixed: submissions, the driver, or the guest itself. If FPS shoots up, the mode where
+  * it rises most points to the culprit.
+  */
+@@ -294,7 +299,7 @@ bool InText(u64 addr) { return addr >= g_text_lo && addr < g_text_hi; }
+ 
+ void PrintAddr(FILE* f, u64 addr) {
+   if (InText(addr)) {
+-    std::fprintf(f, "imagen+0x%" PRIx64, addr - g_base);
++    std::fprintf(f, "image+0x%" PRIx64, addr - g_base);
+   } else {
+     std::fprintf(f, "0x%016" PRIx64, addr);
+   }
+@@ -386,11 +391,11 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+     total_cpu += g_slots[i].cpu;
+   }
+   std::fprintf(f,
+-               "==== %.1f s | modo: %s | juego %.1f fps | CPU total %.0f%% (400%% = 4 nucleos) | fallos/s: "
+-               "lectura emulada %.0f, manejador SDK %.0f, reintento emulado %.0f, SEH %.0f, "
+-               "fisica confirmada %.0f, vistas %.0f | invitado %zu/%zu MB (respaldo/mapeado) | "
+-               "limite de mapeo %llu/%llu MB, proceso %llu/%llu MB | "
+-               "muestras %zu | vigilancia: %s | samplers: %.0f nuevos/s, %.0f parones/s\n",
++               "==== %.1f s | mode: %s | game %.1f fps | CPU total %.0f%% (400%% = 4 cores) | faults/s: "
++               "emulated read %.0f, SDK handler %.0f, emulated retry %.0f, SEH %.0f, "
++               "physical committed %.0f, views %.0f | guest %zu/%zu MB (backed/mapped) | "
++               "mapping limit %llu/%llu MB, process %llu/%llu MB | "
++               "samples %zu | watches: %s | samplers: %.0f new/s, %.0f stalls/s\n",
+                seconds, mode, double(counters_now[0] - counters_last[0]) / seconds, total_cpu,
+                double(counters_now[1] - counters_last[1]) / seconds,
+                double(counters_now[2] - counters_last[2]) / seconds,
+@@ -400,9 +405,9 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+                double(counters_now[18] - counters_last[18]) / seconds,
+                RexGmCommittedBytes() >> 20, RexGmMappedBytes() >> 20,
+                (u64)lim_usado, (u64)lim_tope, (u64)proc_usado, (u64)proc_total, g_sample_count,
+-                (RexGmModoProteccion() == 1   ? "permisos (paginas legibles)"
+-                 : RexGmModoProteccion() == 2 ? "desmapeo (cada lectura falla)"
+-                                              : "sin probar"),
++                (RexGmModoProteccion() == 1   ? "permissions (pages readable)"
++                 : RexGmModoProteccion() == 2 ? "unmapping (every read faults)"
++                                              : "not tested"),
+                 double(counters_now[20] - counters_last[20]) / seconds,
+                 double(counters_now[19] - counters_last[19]) / seconds);
+   // Work the game sends to the GPU, per presented frame. One screen is
+@@ -414,13 +419,13 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+   // in handheld mode.
+   const u64 pico_audio = g_counters[23].exchange(0, std::memory_order_relaxed);
+   std::fprintf(f,
+-               "     audio: %.0f bloques de cliente mezclados, %.0f solicitudes sin datos, "
+-               "%.0f/%.0f buffers audout con PCM no nulo, %.0f muestras saturadas (mas de 1,0 antes de recortar), "
+-               "%.0f buffers con pico de 0,98 o mas, pico maximo %.3f | consola en modo %s\n",
++               "     audio: %.0f client blocks mixed, %.0f requests without data, "
++               "%.0f/%.0f audout buffers with non-zero PCM, %.0f saturated samples (over 1.0 before clipping), "
++               "%.0f buffers peaking at 0.98 or more, max peak %.3f | console %s\n",
+                delta(24), delta(25), delta(26), delta(27), delta(21), delta(22), double(pico_audio) / 10000.0,
+                rex::ui::switch_saltynx::ModoBase(appletGetOperationMode() == AppletOperationMode_Console)
+-                   ? "sobremesa"
+-                   : "portatil");
++                   ? "docked"
++                   : "handheld");
+   // Reverse-NX state as is, without interpretation. A whole test session was wasted because its
+   // overlay said "Docked" while "Controlled by system" was Yes, and in that case its mode does not
+   // rule: it only mirrors the console's. This shows at a glance which of the two is happening.
+@@ -428,16 +433,16 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+     const auto reverse = rex::ui::switch_saltynx::EstadoReverse();
+     const bool real = appletGetOperationMode() == AppletOperationMode_Console;
+     if (!reverse.hay) {
+-      std::fprintf(f, "     Reverse-NX: sin bloque (consola %s, manda ella)\n",
+-                   real ? "en la base" : "en las manos");
++      std::fprintf(f, "     Reverse-NX: no block (console %s, the console decides)\n",
++                   real ? "docked" : "handheld");
+     } else {
+       std::fprintf(f,
+-                   "     Reverse-NX: dice %s, manda %s (Controlled by system %s), el juego ha preguntado: %s; "
+-                   "consola de verdad %s -> se obedece %s\n",
+-                   reverse.en_base ? "sobremesa" : "portatil", reverse.por_defecto ? "la consola" : "Reverse-NX",
+-                   reverse.por_defecto ? "Yes" : "No", reverse.plugin_activo ? "si" : "no",
+-                   real ? "en la base" : "en las manos",
+-                   rex::ui::switch_saltynx::ModoBase(real) ? "sobremesa" : "portatil");
++                   "     Reverse-NX: says %s, decided by %s (Controlled by system %s), game has asked: %s; "
++                   "console really %s -> obeying %s\n",
++                   reverse.en_base ? "docked" : "handheld", reverse.por_defecto ? "the console" : "Reverse-NX",
++                   reverse.por_defecto ? "Yes" : "No", reverse.plugin_activo ? "yes" : "no",
++                   real ? "docked" : "handheld",
++                   rex::ui::switch_saltynx::ModoBase(real) ? "docked" : "handheld");
+     }
+   }
+   // Real console clocks (clkrst, 8.0.0+) and the cores the process may use. It tells whether the
+@@ -493,12 +498,12 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+       tsSessionGetTemperature(&ts_placa, &grados_placa);
+     }
+     std::fprintf(f,
+-                 "     relojes: CPU %.1f MHz, GPU %.1f MHz, memoria %.1f MHz%s | nucleos del proceso %u "
+-                 "(mascara 0x%llX) | SoC %.1f C, placa %.1f C%s\n",
++                 "     clocks: CPU %.1f MHz, GPU %.1f MHz, memory %.1f MHz%s | process cores %u "
++                 "(mask 0x%llX) | SoC %.1f C, board %.1f C%s\n",
+                  double(hz[0]) / 1.0e6, double(hz[1]) / 1.0e6, double(hz[2]) / 1.0e6,
+-                 hay_clkrst ? "" : " (clkrst no disponible)", nucleos,
++                 hay_clkrst ? "" : " (clkrst unavailable)", nucleos,
+                  (unsigned long long)mascara_nucleos, double(grados_soc), double(grados_placa),
+-                 hay_ts ? "" : " (ts no disponible)");
++                 hay_ts ? "" : " (ts unavailable)");
+   }
+   // libnx calls: per second, with the ms per second the calling threads spend inside.
+   {
+@@ -516,11 +521,11 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+       ultimo[i][2] = vb;
+     }
+     std::fprintf(f,
+-                 "     libnx por segundo (llamadas y ms dentro): fences consultadas %.0f (%.1f ms), esperadas %.0f "
+-                 "(%.1f ms) | kickoff %.0f (%.1f ms) | NvMap nuevos %.1f con cache (%.1f MB) y %.1f sin cache "
+-                 "(%.1f MB), %.1f ms | direcciones de GPU %.1f (%.1f ms), mapeos %.1f (%.1f MB, %.1f ms) | "
+-                 "armDCacheClean %.0f (%.1f MB, %.1f ms) | cola de la ventana %.1f (%.1f ms), sacar buffer %.1f "
+-                 "(%.1f ms) | svcSleepThread: 0 %.0f, ceder %.0f, hasta 1 ms %.0f (%.1f ms), mas %.0f\n",
++                 "     libnx per second (calls and ms inside): fences polled %.0f (%.1f ms), waited %.0f "
++                 "(%.1f ms) | kickoff %.0f (%.1f ms) | NvMap new %.1f cached (%.1f MB) and %.1f uncached "
++                 "(%.1f MB), %.1f ms | GPU addresses %.1f (%.1f ms), mappings %.1f (%.1f MB, %.1f ms) | "
++                 "armDCacheClean %.0f (%.1f MB, %.1f ms) | window queue %.1f (%.1f ms), dequeue buffer %.1f "
++                 "(%.1f ms) | svcSleepThread: 0 %.0f, yield %.0f, up to 1 ms %.0f (%.1f ms), longer %.0f\n",
+                  n[kFenceConsulta], ms[kFenceConsulta], n[kFenceEspera], ms[kFenceEspera], n[kKickoff],
+                  ms[kKickoff], n[kNvMapCacheada], mb[kNvMapCacheada], n[kNvMapSinCache], mb[kNvMapSinCache],
+                  ms[kNvMapCacheada] + ms[kNvMapSinCache], n[kReservaDireccion], ms[kReservaDireccion],
+@@ -530,17 +535,17 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+   }
+   if (frames > 0) {
+     std::fprintf(f,
+-                 "     por fotograma: %.0f dibujados | tijera %.1f pantallas | %.1f envios | "
+-                 "%.1f resolves (%.2f pantallas) | transferencias: %.1f llamadas, %.1f render "
+-                 "targets, %.1f dibujados | %.1f texturas cargadas | %.2f MB de memoria "
+-                 "compartida subida | pipelines creados en el intervalo: %.0f\n",
++                 "     per frame: %.0f draws | scissor %.1f screens | %.1f submits | "
++                 "%.1f resolves (%.2f screens) | transfers: %.1f calls, %.1f render "
++                 "targets, %.1f draws | %.1f textures uploaded | %.2f MB of shared "
++                 "memory uploaded | pipelines created in the interval: %.0f\n",
+                  delta(5) / frames, delta(6) / frames / 921600.0, delta(7) / frames,
+                  delta(9) / frames, delta(10) / frames / 921600.0, delta(11) / frames,
+                  delta(12) / frames, delta(13) / frames, delta(14) / frames,
+                  delta(15) / frames / 1048576.0, delta(16));
+     std::fprintf(f,
+-                 "     dibujados por ancho de superficie: 1600+ %.0f | 1280-1599 %.0f | "
+-                 "640-1279 %.0f | 256-639 %.0f | menos de 256 %.0f\n",
++                 "     draws by surface width: 1600+ %.0f | 1280-1599 %.0f | "
++                 "640-1279 %.0f | 256-639 %.0f | under 256 %.0f\n",
+                  delta(28) / frames, delta(29) / frames, delta(30) / frames, delta(31) / frames,
+                  delta(32) / frames);
+   }
+@@ -568,7 +573,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+         auto it = std::upper_bound(v.begin(), v.end(), t, [](u64 x, const VentanaTiron& w) { return x < w.inicio; });
+         return it != v.begin() && t <= (it - 1)->fin;
+       };
+-      std::fprintf(f, "\n== durante los tirones: %u fotogramas de mas de 45 ms (%.0f ms en total) ==\n", nt, ms_total);
++      std::fprintf(f, "\n== during the stutters: %u frames over 45 ms (%.0f ms in total) ==\n", nt, ms_total);
+       for (size_t i : order) {
+         std::vector<u64> pcs;
+         std::vector<const Sample*> todas;
+@@ -588,7 +593,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+           continue;
+         }
+         const Slot& s = g_slots[i];
+-        std::fprintf(f, "-- hilo \"%s\": %zu muestras en los tirones, %.0f%% esperando en el kernel\n",
++        std::fprintf(f, "-- thread \"%s\": %zu samples in the stutters, %.0f%% waiting in the kernel\n",
+                      s.name[0] ? s.name : "?", todas.size(), double(en_svc) * 100.0 / double(todas.size()));
+         const auto h = Histogram(pcs);
+         for (size_t k = 0; k < h.size() && k < 25; ++k) {
+@@ -609,7 +614,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+         }
+         std::sort(pilas.begin(), pilas.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+         for (size_t k = 0; k < pilas.size() && k < 10; ++k) {
+-          std::fprintf(f, "   %5.1f%%  pila", double(pilas[k].second) * 100.0 / double(todas.size()));
++          std::fprintf(f, "   %5.1f%%  stack", double(pilas[k].second) * 100.0 / double(todas.size()));
+           for (size_t j = 0; j < kFrames && pilas[k].first->frames[j]; ++j) {
+             std::fputs(j == 0 ? " " : " <- ", f);
+             PrintAddr(f, pilas[k].first->frames[j]);
+@@ -636,8 +641,8 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+     svcGetThreadPriority(&prioridad, s.handle.load());
+     svcGetThreadCoreMask(&preferido, &mascara, s.handle.load());
+     std::fprintf(f,
+-                 "\n-- hilo %" PRIu64 " \"%s\": CPU %.1f%% | prioridad 0x%X, nucleo preferido %d, "
+-                 "mascara 0x%llX\n",
++                 "\n-- thread %" PRIu64 " \"%s\": CPU %.1f%% | priority 0x%X, preferred core %d, "
++                 "mask 0x%llX\n",
+                  tid, s.name[0] ? s.name : "?", s.cpu, static_cast<unsigned>(prioridad),
+                  static_cast<int>(preferido), static_cast<unsigned long long>(mascara));
+ 
+@@ -647,7 +652,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+                                [](size_t v, const Sample& a) { return v < a.slot; });
+     const size_t n = size_t(hi - lo);
+     if (n == 0) {
+-      std::fprintf(f, "   sin muestras\n");
++      std::fprintf(f, "   no samples\n");
+       continue;
+     }
+     std::vector<u64> pcs, lrs;
+@@ -660,7 +665,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+       pcs.push_back(it->pc);
+       lrs.push_back(it->lr);
+     }
+-    std::fprintf(f, "   %zu muestras, %.0f%% esperando en el kernel\n", n,
++    std::fprintf(f, "   %zu samples, %.0f%% waiting in the kernel\n", n,
+                  double(in_svc) * 100.0 / double(n));
+     const auto pc_hist = Histogram(pcs);
+     const size_t busy = pcs.size();
+@@ -700,7 +705,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+     std::sort(stacks.begin(), stacks.end(),
+               [](const StackCount& a, const StackCount& b) { return a.n > b.n; });
+     for (size_t k = 0; k < stacks.size() && k < (activo ? 30u : 3u); ++k) {
+-      std::fprintf(f, "   %5.1f%%  pila", double(stacks[k].n) * 100.0 / double(n));
++      std::fprintf(f, "   %5.1f%%  stack", double(stacks[k].n) * 100.0 / double(n));
+       for (size_t j = 0; j < kFrames && stacks[k].s->frames[j]; ++j) {
+         std::fputs(j == 0 ? " " : " <- ", f);
+         PrintAddr(f, stacks[k].s->frames[j]);
+@@ -813,10 +818,15 @@ void ProfilerMain(void*) {
+   for (unsigned i = 0; i < kCounterCount; ++i) {
+     counters_last[i] = g_counters[i].load(std::memory_order_relaxed);
+   }
+-  if (FILE* f = std::fopen(ReportPath().c_str(), "w")) {
+-    std::fprintf(f, "imagen 0x%016" PRIx64 ", codigo hasta 0x%016" PRIx64 "\n\n", g_base,
++  if (!RexSwitchLogFilesOn()) {
++    g_reports.store(false);
++    std::remove(ReportPath().c_str());  // a stale one from a development build
++  }
++  if (g_reports.load() && (f_report_dummy = std::fopen(ReportPath().c_str(), "w")) != nullptr) {
++    FILE* f = f_report_dummy;
++    std::fprintf(f, "image 0x%016" PRIx64 ", code up to 0x%016" PRIx64 "\n\n", g_base,
+                  g_text_hi);
+-    std::fprintf(f, "Muestreo de pilas: %s\n", sample_stacks ? "activo (1 ms)" : "desactivado");
++    std::fprintf(f, "Stack sampling: %s\n", sample_stacks ? "on (1 ms)" : "off");
+     std::fclose(f);
+   }
+ 
+@@ -825,7 +835,7 @@ void ProfilerMain(void*) {
+ 
+   // A short first report just to set the starting CPU time.
+   u64 report_start = armGetSystemTick();
+-  Report(1, tick_freq, counters_last, "arranque");
++  if (g_reports.load()) Report(1, tick_freq, counters_last, "startup");
+   report_start = armGetSystemTick();
+ 
+   size_t rr = 0;
+@@ -878,7 +888,8 @@ void ProfilerMain(void*) {
+     // Once per second, FPS and resolution for the overlay (the profile report runs every 10 s).
+     overlay.Paso(now, tick_freq, true);
+     if (now - report_start >= kReportSeconds * tick_freq) {
+-      Report(now - report_start, tick_freq, counters_last, kModes[mode_index].name);
++      if (g_reports.load(std::memory_order_relaxed))
++        Report(now - report_start, tick_freq, counters_last, kModes[mode_index].name);
+       if (g_ab_activas.load(std::memory_order_relaxed)) {
+         mode_index = (mode_index + 1) % kModeCount;
+         g_skip_mask.store(kModes[mode_index].mask, std::memory_order_relaxed);
+@@ -902,7 +913,7 @@ __attribute__((constructor(102))) void StartProfiler() {
+     g_text_hi = mi.addr + mi.size;
+   }
+   Register(envGetMainThreadHandle());
+-  std::strncpy(g_slots[0].name, "main (interfaz)", sizeof(g_slots[0].name) - 1);
++  std::strncpy(g_slots[0].name, "main (UI)", sizeof(g_slots[0].name) - 1);
+   // 0x2A: above everything in the game (audio runs at 0x2B), so the samples
+   // are taken on time. It sleeps almost all the time.
+   if (R_SUCCEEDED(__real_threadCreate(&g_thread, ProfilerMain, nullptr, nullptr, 0x10000, 0x2A,
+@@ -1029,6 +1040,8 @@ void RexSwitchPerfTiron(u64 inicio, u64 fin) {
+   }
+ }
+ 
++void RexSwitchPerfReports(int on) { g_reports.store(on != 0); }
++
+ void RexSwitchPerfResolution(unsigned ancho, unsigned alto) {
+   g_resolucion.store(((ancho & 0xFFFF) << 16) | (alto & 0xFFFF), std::memory_order_relaxed);
+ }
+diff --git a/sdk/src/ui/switch_saltynx.cpp b/sdk/src/ui/switch_saltynx.cpp
+index 56b0c44..0aca3b4 100644
+--- a/sdk/src/ui/switch_saltynx.cpp
++++ b/sdk/src/ui/switch_saltynx.cpp
+@@ -79,7 +79,7 @@ struct BloqueFps {
+   int8_t buffers_esperados;
+ } __attribute__((packed));
+ 
+-static_assert(sizeof(BloqueFps) == 174, "el overlay espera 174 bytes");
++static_assert(sizeof(BloqueFps) == 174, "the overlay expects 174 bytes");
+ 
+ /* struct Shared de ReverseNX-RT (9 bytes). */
+ struct BloqueReverseNx {
+@@ -244,7 +244,7 @@ void AvisarPublicado(const BloqueFps* bloque) {
+   const unsigned desplazamiento =
+       g_base ? unsigned(reinterpret_cast<const uint8_t*>(bloque) - static_cast<const uint8_t*>(g_base)) : 0u;
+   std::fprintf(stderr,
+-               "[saltynx] PUBLICADO a los %.2f s del arranque: FPS=%u y RES=%ux%u en el desplazamiento 0x%X\n",
++               "[saltynx] PUBLISHED %.2f s after startup: FPS=%u and RES=%ux%u at offset 0x%X\n",
+                segundos, unsigned(g_ultimo_fps), unsigned(g_ultimo_ancho), unsigned(g_ultimo_alto),
+                desplazamiento);
+ }
+@@ -313,16 +313,16 @@ bool BuscarMemoriaCompartidaPropia() {
+  */
+ void Diagnostico(Result rc_saltysd) {
+   if (rc_saltysd == 0) {
+-    Aviso("[saltynx] ni se ha intentado: el proceso no tiene sitio para otra sesion de puerto");
++    Aviso("[saltynx] not even tried: the process has no room for another port session");
+   } else {
+-    AvisoNum("[saltynx] no conecta con los puertos de SaltyNX. Ultimo error", rc_saltysd);
++    AvisoNum("[saltynx] cannot connect to the SaltyNX ports. Last error", rc_saltysd);
+   }
+ 
+   // Our own title ID: SaltyNX rejects those above 0x01FFFFFFFFFFFFFF ("is a homebrew application"),
+   // which is exactly the range forwarders fall in. Knowing it saves a question.
+   u64 titulo = 0;
+   if (R_SUCCEEDED(svcGetInfo(&titulo, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0))) {
+-    std::fprintf(stderr, "[saltynx] nuestro TID: %016llX (SaltyNX admite <= 01FFFFFFFFFFFFFF y sin 0x1F00)\n",
++    std::fprintf(stderr, "[saltynx] our TID: %016llX (SaltyNX accepts <= 01FFFFFFFFFFFFFF and without 0x1F00)\n",
+                  (unsigned long long)titulo);
+   }
+ 
+@@ -333,9 +333,9 @@ void Diagnostico(Result rc_saltysd) {
+     const Result rc = svcConnectToNamedPort(&h, p);
+     if (R_SUCCEEDED(rc)) {
+       svcCloseHandle(h);
+-      Aviso(p[0] == 'I' ? "[saltynx] puerto InjectServ: SI conecta" : "[saltynx] puerto SaltySD: SI conecta");
++      Aviso(p[0] == 'I' ? "[saltynx] port InjectServ: connects" : "[saltynx] port SaltySD: connects");
+     } else {
+-      AvisoNum(p[0] == 'I' ? "[saltynx] puerto InjectServ: error" : "[saltynx] puerto SaltySD: error", rc);
++      AvisoNum(p[0] == 'I' ? "[saltynx] port InjectServ: error" : "[saltynx] port SaltySD: error", rc);
+     }
+   }
+ 
+@@ -343,9 +343,9 @@ void Diagnostico(Result rc_saltysd) {
+   const Result rc_sm = svcConnectToNamedPort(&control, "sm:");
+   if (R_SUCCEEDED(rc_sm)) {
+     svcCloseHandle(control);
+-    Aviso("[saltynx] control: 'sm:' SI da sesion nueva, asi que el limite es del puerto de SaltyNX");
++    Aviso("[saltynx] check: 'sm:' DOES give a new session, so the limit is SaltyNX's port");
+   } else {
+-    AvisoNum("[saltynx] control: 'sm:' tampoco da sesion, asi que el limite es NUESTRO. Error", rc_sm);
++    AvisoNum("[saltynx] check: 'sm:' gives no session either, so the limit is OURS. Error", rc_sm);
+   }
+ 
+   u64 bruto = 0;
+@@ -354,7 +354,7 @@ void Diagnostico(Result rc_saltysd) {
+     rc_lim = svcGetInfo(&bruto, InfoType_ResourceLimit, CUR_PROCESS_HANDLE, 0);
+   }
+   if (R_FAILED(rc_lim)) {
+-    AvisoNum("[saltynx] no se pueden leer los limites del proceso. Error", rc_lim);
++    AvisoNum("[saltynx] cannot read the process limits. Error", rc_lim);
+     return;
+   }
+   const Handle limite = static_cast<Handle>(bruto);
+@@ -363,10 +363,10 @@ void Diagnostico(Result rc_saltysd) {
+     LimitableResource cual;
+   };
+   const Recurso kRecursos[] = {
+-      {"[saltynx] sesiones usadas / tope:", LimitableResource_Sessions},
+-      {"[saltynx] eventos usados / tope:", LimitableResource_Events},
+-      {"[saltynx] hilos usados / tope:", LimitableResource_Threads},
+-      {"[saltynx] memorias transferibles usadas / tope:", LimitableResource_TransferMemories},
++      {"[saltynx] sessions used / limit:", LimitableResource_Sessions},
++      {"[saltynx] events used / limit:", LimitableResource_Events},
++      {"[saltynx] threads used / limit:", LimitableResource_Threads},
++      {"[saltynx] transfer memories used / limit:", LimitableResource_TransferMemories},
+   };
+   for (const Recurso& r : kRecursos) {
+     s64 ahora = 0;
+@@ -438,12 +438,12 @@ bool HacerSitio(bool* sm_cerrado, bool permitir_soltar_sm) {
+                                                       static_cast<u64>(tope + 4));
+       if (R_SUCCEEDED(rc)) {
+         sitio = HaySitioParaUnaSesion(limite);
+-        AvisoDos("[saltynx] subido el tope de sesiones del proceso:", (long long)tope, (long long)(tope + 4));
++        AvisoDos("[saltynx] raised the process session limit:", (long long)tope, (long long)(tope + 4));
+       } else {
+-        AvisoNum("[saltynx] no deja subir el tope de sesiones. Error", rc);
++        AvisoNum("[saltynx] cannot raise the session limit. Error", rc);
+       }
+     } else {
+-      Aviso("[saltynx] el cargador no permite svcSetResourceLimitLimitValue (SVC 0x7E)");
++      Aviso("[saltynx] the loader does not allow svcSetResourceLimitLimitValue (SVC 0x7E)");
+     }
+   }
+ 
+@@ -452,10 +452,10 @@ bool HacerSitio(bool* sm_cerrado, bool permitir_soltar_sm) {
+     if (HaySitioParaUnaSesion(limite)) {
+       *sm_cerrado = true;
+       sitio = true;
+-      Aviso("[saltynx] soltado 'sm:' un momento para tener sitio");
++      Aviso("[saltynx] released 'sm:' for a moment to make room");
+     } else {
+       smInitialize();  // it did not close: restore the count and leave it as it was
+-      Aviso("[saltynx] ni soltando 'sm:' hay sitio para una sesion");
++      Aviso("[saltynx] no room for a session even after releasing 'sm:'");
+     }
+   }
+ 
+@@ -601,14 +601,14 @@ void Iniciar() {
+ 
+   if (nombre && !g_avisado_conexion) {
+     g_avisado_conexion = true;  // once; this is retried every second and used to fill the log
+-    Aviso(nombre[0] == 'S' ? "[saltynx] conectado por SaltySD" : "[saltynx] conectado por InjectServ");
++    Aviso(nombre[0] == 'S' ? "[saltynx] connected through SaltySD" : "[saltynx] connected through InjectServ");
+   }
+   if (!g_mapeada) {
+     if (R_FAILED(rc_manejador) && !g_avisado_sin_memoria) {
+       // A port connected but did not serve the memory. The attempt is not lost: the other one has already
+       // been tried. Only once: this is retried every second for the whole session and used to fill the log.
+       g_avisado_sin_memoria = true;
+-      AvisoNum("[saltynx] algun puerto conecta pero no da la memoria compartida; error", rc_manejador);
++      AvisoNum("[saltynx] a port connects but gives no shared memory; error", rc_manejador);
+     }
+     // Path 2: no free session. If SaltyNX was injected into this process, its shared memory is already mapped here.
+     if (!BuscarMemoriaCompartidaPropia()) {
+@@ -620,12 +620,12 @@ void Iniciar() {
+       if (g_intentos == 5 || g_intentos == 30) {
+         Diagnostico(rc_puerto);
+       } else if (g_intentos % 600 == 0) {
+-        AvisoNum("[saltynx] se sigue reintentando sin exito. Error", rc_puerto);
++        AvisoNum("[saltynx] still retrying without success. Error", rc_puerto);
+       }
+       return;
+     }
+     g_mapeada = true;
+-    Aviso("[saltynx] sin sesion en los puertos, pero su memoria compartida ya estaba mapeada aqui");
++    Aviso("[saltynx] no session on the ports, but their shared memory was already mapped here");
+   }
+ 
+   // The FPS block: if SaltyNX already left one in this process it is overwritten (its fields would be
+@@ -635,17 +635,17 @@ void Iniciar() {
+     g_fps.store(existente, std::memory_order_release);
+     if (!g_avisado_bloque) {
+       g_avisado_bloque = true;
+-      Aviso("[saltynx] bloque de FPS ya presente: se escribe encima");
++      Aviso("[saltynx] FPS block already present: writing over it");
+     }
+   } else if (reservada) {
+     auto* bloque = reinterpret_cast<BloqueFps*>(g_base + desplazamiento);
+     std::memset(bloque, 0, sizeof(*bloque));
+     bloque->magic = kMagicFps;
+     g_fps.store(bloque, std::memory_order_release);
+-    AvisoNum("[saltynx] bloque de FPS creado en el desplazamiento", (long long)desplazamiento);
++    AvisoNum("[saltynx] FPS block created at offset", (long long)desplazamiento);
+   } else if (!g_avisado_sin_sitio) {
+     g_avisado_sin_sitio = true;
+-    Aviso("[saltynx] sin sitio para el bloque de FPS; se sigue intentando una vez por segundo");
++    Aviso("[saltynx] no room for the FPS block; retrying once a second");
+   }
+   if (BloqueFps* bloque = g_fps.load(std::memory_order_acquire)) {
+     // FPS and resolution at once, without waiting for the next second or the next present.
+@@ -672,10 +672,10 @@ void Iniciar() {
+     std::memset(reverse, 0, sizeof(*reverse));
+     reverse->magic = kMagicReverseNx;
+     reverse->por_defecto = true;  // the system decides until the player says otherwise
+-    AvisoNum("[saltynx] bloque de Reverse-NX creado en el desplazamiento", (long long)desplazamiento_nx);
++    AvisoNum("[saltynx] Reverse-NX block created at offset", (long long)desplazamiento_nx);
+   } else if (!g_avisado_reverse) {
+     g_avisado_reverse = true;  // once, since this is retried every second
+-    Aviso(reverse ? "[saltynx] bloque de Reverse-NX ya presente" : "[saltynx] sin sitio para el bloque de Reverse-NX");
++    Aviso(reverse ? "[saltynx] Reverse-NX block already present" : "[saltynx] no room for the Reverse-NX block");
+   }
+   // Only stored if there is one. Otherwise a retry would write nullptr over a good pointer.
+   if (reverse) {
+diff --git a/sdk/src/ui/switch_sysclk.cpp b/sdk/src/ui/switch_sysclk.cpp
+index 6766c0b..bf607e3 100644
+--- a/sdk/src/ui/switch_sysclk.cpp
++++ b/sdk/src/ui/switch_sysclk.cpp
+@@ -149,7 +149,7 @@ Result PedirContextoDe(unsigned char* salida) {
+ 
+ void Volcar(const unsigned char* buf, unsigned tam) {
+   char linea[340];
+-  int n = std::snprintf(linea, sizeof(linea), "[relojes] contexto (%u bytes):", tam);
++  int n = std::snprintf(linea, sizeof(linea), "[clocks] context (%u bytes):", tam);
+   for (unsigned i = 0; i < tam && n > 0 && unsigned(n) + 4 < sizeof(linea); ++i) {
+     n += std::snprintf(linea + n, sizeof(linea) - unsigned(n), " %02X", buf[i]);
+   }
+@@ -169,7 +169,7 @@ void VolcarContexto() {
+   if (R_SUCCEEDED(PedirContextoDe<56>(buf))) { Volcar(buf, 56); return; }
+   if (R_SUCCEEDED(PedirContextoDe<64>(buf))) { Volcar(buf, 64); return; }
+   if (R_SUCCEEDED(PedirContextoDe<72>(buf))) { Volcar(buf, 72); return; }
+-  Aviso("[relojes] GetCurrentContext no cuela con ninguno de los tamanos probados");
++  Aviso("[clocks] GetCurrentContext fails with every size tried");
+ }
+ 
+ Result PonerOverride(uint32_t modulo, uint32_t hz) {
+@@ -237,8 +237,8 @@ bool Abrir() {
+   }
+   if (!elegido) {
+     if (g_intentos == 1) {
+-      Aviso("[relojes] no encuentro ningun sysmodule de relojes conocido (probados: sys:clk, hoc:clk, "
+-            "hocclk, sysclk, clk:sys, sys:oc): no hay a quien pedirselo");
++      Aviso("[clocks] no known clock sysmodule found (tried: sys:clk, hoc:clk, "
++            "hocclk, sysclk, clk:sys, sys:oc): nobody to ask");
+     }
+     g_intentos = 5;  // no volver a preguntar
+     return false;
+@@ -246,7 +246,7 @@ bool Abrir() {
+   const Result rc = smGetService(&g_servicio, elegido);
+   if (R_FAILED(rc)) {
+     if (g_intentos == 1) {
+-      std::fprintf(stderr, "[relojes] hay '%s' pero no se pudo abrir. Error 0x%X\n", elegido,
++      std::fprintf(stderr, "[clocks] '%s' exists but could not be opened. Error 0x%X\n", elegido,
+                    (unsigned)rc);
+     }
+     return false;
+@@ -255,8 +255,8 @@ bool Abrir() {
+   uint32_t version = 0;
+   if (R_FAILED(PedirVersionApi(&version))) {
+     std::fprintf(stderr,
+-                 "[relojes] '%s' abierto pero no contesta a GetApiVersion: no es la interfaz de "
+-                 "sys-clk, no se toca nada (servicios hallados: %s)\n",
++                 "[clocks] '%s' opened but does not answer GetApiVersion: not the sys-clk "
++                 "interface, changing nothing (services found: %s)\n",
+                  elegido, hallados);
+     serviceClose(&g_servicio);
+     g_intentos = 5;
+@@ -267,16 +267,16 @@ bool Abrir() {
+   if (R_SUCCEEDED(PedirVersionTexto(version_texto, sizeof(version_texto)))) {
+     version_texto[sizeof(version_texto) - 1] = 0;
+     char linea[160];
+-    std::snprintf(linea, sizeof(linea), "[relojes] version del sysmodule: %s", version_texto);
++    std::snprintf(linea, sizeof(linea), "[clocks] sysmodule version: %s", version_texto);
+     Aviso(linea);
+   } else {
+-    Aviso("[relojes] el sysmodule no contesta a GetVersionString (orden 1)");
++    Aviso("[clocks] the sysmodule does not answer GetVersionString (command 1)");
+   }
+   VolcarContexto();
+-  std::fprintf(stderr, "[relojes] sysmodule '%s', API %u (servicios hallados: %s)\n", elegido,
++  std::fprintf(stderr, "[clocks] sysmodule '%s', API %u (services found: %s)\n", elegido,
+                (unsigned)version, hallados);
+   g_abierto = true;
+-  Aviso("[relojes] listo: los relojes pueden seguir a Reverse-NX");
++  Aviso("[clocks] ready: the clocks can follow Reverse-NX");
+   return true;
+ }
+ 
+@@ -335,7 +335,7 @@ void Aplicar(bool a_sobremesa) {
+     }
+   }
+   if (!hz[0] && !hz[1] && !hz[2]) {
+-    Aviso("[relojes] no tienes nada puesto en esa columna: no se toca nada");
++    Aviso("[clocks] nothing set in that column: changing nothing");
+     return;
+   }
+   for (unsigned m = 0; m < kModulos; ++m) {
+@@ -344,8 +344,8 @@ void Aplicar(bool a_sobremesa) {
+     }
+   }
+   std::fprintf(stderr,
+-               "[relojes] %s por Reverse-NX: CPU %u kHz, GPU %u kHz, memoria %u kHz (0 = como estaba)\n",
+-               a_sobremesa ? "sobremesa" : "portatil", hz[0] / 1000u, hz[1] / 1000u, hz[2] / 1000u);
++               "[clocks] %s by Reverse-NX: CPU %u kHz, GPU %u kHz, memory %u kHz (0 = unchanged)\n",
++               a_sobremesa ? "docked" : "handheld", hz[0] / 1000u, hz[1] / 1000u, hz[2] / 1000u);
+ }
+ 
+ void Soltar() {
+@@ -360,7 +360,7 @@ void Soltar() {
+     }
+   }
+   if (alguno) {
+-    Aviso("[relojes] soltados: los vuelve a poner el sysmodule");
++    Aviso("[clocks] released: the sysmodule sets them again");
+   }
+ }
+ 
+diff --git a/sdk/src/ui/vulkan/vulkan_device.cpp b/sdk/src/ui/vulkan/vulkan_device.cpp
+index 0279615..6ea6b37 100644
+--- a/sdk/src/ui/vulkan/vulkan_device.cpp
++++ b/sdk/src/ui/vulkan/vulkan_device.cpp
+@@ -23,7 +23,7 @@
+ #include <rex/ui/vulkan/device.h>
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_native_shader_features, false, "UI/Vulkan",
+-                    "Habilitar capacidades disponibles para los shaders nativos experimentales")
++                    "Enable the features available to the experimental native shaders")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
+diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_presenter.cpp
+index 271e8b6..44d5ccd 100644
+--- a/sdk/src/ui/vulkan/vulkan_presenter.cpp
++++ b/sdk/src/ui/vulkan/vulkan_presenter.cpp
+@@ -66,8 +66,8 @@ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+ // this, acquisition uses a fence that is waited on the CPU, without the queue lock, and the paint
+ // goes without a semaphore.
+ REXCVAR_DEFINE_BOOL(present_esperar_adquisicion_en_cpu, false, "UI/Presenter",
+-                    "Esperar la imagen de la cadena de intercambio en la CPU (fence) en vez de con un semaforo en el "
+-                    "pintado, para no parar el canal de la GPU (prueba de FPS en la Switch)")
++                    "Wait for the swapchain image on the CPU (fence) instead of with a semaphore in the "
++                    "paint, so the GPU channel is not stalled (FPS test on the Switch)")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ #if REX_PLATFORM_SWITCH
+@@ -161,10 +161,10 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
+  * (armGetSystemTick, no syscall): on the order of 1 us out of 39,000.
+  */
+ REXCVAR_DEFINE_BOOL(present_perfil_pintado, REX_PRESENT_PERFIL_PINTADO_DEFAULT, "UI/Presenter",
+-                    "Medir trozo a trozo el tiempo que el hilo que pinta pasa dentro de "
+-                    "PaintAndPresent (espera al envio antiguo, reset del pool, adquisicion, buzon, "
+-                    "grabacion, candados de la cola, vkQueueSubmit y vkQueuePresentKHR) y volcarlo "
+-                    "cada 600 fotogramas. Apagado no cuesta nada")
++                    "Measure piece by piece the time the paint thread spends inside "
++                    "PaintAndPresent (wait for the old submit, pool reset, acquire, mailbox, "
++                    "recording, queue locks, vkQueueSubmit and vkQueuePresentKHR) and log it "
++                    "every 600 frames. Costs nothing when off")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ /*
+@@ -199,9 +199,9 @@ REXCVAR_DEFINE_BOOL(present_perfil_pintado, REX_PRESENT_PERFIL_PINTADO_DEFAULT,
+ // was the sky deferral, but this one touches output synchronization, so it was turned off to return
+ // to known ground.
+ REXCVAR_DEFINE_BOOL(present_refresco_sellado_perezoso, false, "UI/Presenter",
+-                    "Quitar el vkQueueSubmit vacio que se hacia en cada refresco de la salida del "
+-                    "juego y sellar solo cuando hay que destruir esa imagen (cambio de tamano o "
+-                    "apagado). Apagado vuelve al envio por fotograma")
++                    "Drop the empty vkQueueSubmit made at every refresh of the game's "
++                    "output and fence only when that image must be destroyed (resize or "
++                    "shutdown). Off goes back to a submit per frame")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ namespace rex {
+@@ -367,14 +367,14 @@ void PintadoVolcarSiToca(uint32_t envios_en_vuelo) {
+   const auto media = [](uint64_t ns) { return double(ns) / 1e6 / 600.0; };
+   const auto peor = [](uint64_t ns) { return double(ns) / 1e6; };
+   REXLOG_INFO(
+-      "[presentador] reparto de PaintAndPresent, 600 fotogramas (media/peor en ms): "
+-      "espera al envio de hace {} {:.2f}/{:.2f} | reset del pool {:.2f}/{:.2f} | "
+-      "adquirir {:.2f}/{:.2f} | buzon {:.2f}/{:.2f} | descriptor {:.2f}/{:.2f} | intermedias {:.2f}/{:.2f} | tuberia {:.2f}/{:.2f} (rehecha {} veces) | efectos {:.2f}/{:.2f} | grabar {:.2f}/{:.2f} | "
+-      "preparar el envio {:.2f}/{:.2f} | candado de la cola {:.2f}/{:.2f} | "
+-      "vkQueueSubmit {:.2f}/{:.2f} | candado de presentar {:.2f}/{:.2f} | "
+-      "vkQueuePresentKHR {:.2f}/{:.2f} | anticipar {:.2f}/{:.2f} | cierre {:.2f}/{:.2f} "
+-      "|| TOTAL {:.2f} || y antes, en el refresco: candado {:.2f}/{:.2f}, "
+-      "vkQueueSubmit vacio {:.2f}/{:.2f}",
++      "[presenter] PaintAndPresent breakdown, 600 frames (mean/worst in ms): "
++      "wait for the submit from {} ago {:.2f}/{:.2f} | pool reset {:.2f}/{:.2f} | "
++      "acquire {:.2f}/{:.2f} | mailbox {:.2f}/{:.2f} | descriptor {:.2f}/{:.2f} | intermediates {:.2f}/{:.2f} | pipeline {:.2f}/{:.2f} (rebuilt {} times) | effects {:.2f}/{:.2f} | record {:.2f}/{:.2f} | "
++      "prepare the submit {:.2f}/{:.2f} | queue lock {:.2f}/{:.2f} | "
++      "vkQueueSubmit {:.2f}/{:.2f} | present lock {:.2f}/{:.2f} | "
++      "vkQueuePresentKHR {:.2f}/{:.2f} | acquire ahead {:.2f}/{:.2f} | close {:.2f}/{:.2f} "
++      "|| TOTAL {:.2f} || and before, in the refresh: lock {:.2f}/{:.2f}, "
++      "empty vkQueueSubmit {:.2f}/{:.2f}",
+       envios_en_vuelo, media(g_pintado_ns[kTrozoEsperaEnvioAntiguo]),
+       peor(g_pintado_ns_peor[kTrozoEsperaEnvioAntiguo]), media(g_pintado_ns[kTrozoResetPool]),
+       peor(g_pintado_ns_peor[kTrozoResetPool]), media(g_pintado_ns[kTrozoAdquirir]),
+@@ -451,7 +451,7 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
+   fence_create_info.pNext = nullptr;
+   fence_create_info.flags = 0;
+   if (dfn.vkCreateFence(device, &fence_create_info, nullptr, &acquire_fence_) != VK_SUCCESS) {
+-    REXLOG_ERROR("VulkanPresenter: no se pudo crear la fence de adquisicion");
++    REXLOG_ERROR("VulkanPresenter: could not create the acquire fence");
+     return false;
+   }
+ 
+@@ -2053,8 +2053,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   {
+     static std::atomic<bool> anotado{false};
+     if (!anotado.exchange(true)) {  // every test switch logs its value
+-      REXLOG_INFO("[presentador] adquisicion esperada en la CPU (present_esperar_adquisicion_en_cpu) = {}",
+-                  adquisicion_en_cpu ? "SI" : "no");
++      REXLOG_INFO("[presenter] acquire waited on the CPU (present_esperar_adquisicion_en_cpu) = {}",
++                  adquisicion_en_cpu ? "YES" : "no");
+     }
+   }
+   uint32_t swapchain_image_index;
+@@ -2105,7 +2105,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     ms_total += ms;
+     ms_maximo = std::max(ms_maximo, ms);
+     if (esperas % 600 == 0) {
+-      REXLOG_INFO("[presentador] espera de adquisicion en la CPU: {} esperas, media {:.2f} ms, maxima {:.2f} ms",
++      REXLOG_INFO("[presenter] acquire wait on the CPU: {} waits, mean {:.2f} ms, max {:.2f} ms",
+                   esperas, ms_total / double(esperas), ms_maximo);
+       ms_maximo = 0.0;
+     }
+@@ -2822,7 +2822,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     const uint64_t total = paint_context_.anticipadas_aciertos + paint_context_.anticipadas_fallos;
+     if (total >= ultimo + 600) {
+       ultimo = total;
+-      REXLOG_INFO("[presentador] adquisicion anticipada: {} de {} fotogramas sin esperar ({:.1f} %)",
++      REXLOG_INFO("[presenter] acquire ahead: {} of {} frames without waiting ({:.1f} %)",
+                   paint_context_.anticipadas_aciertos, total,
+                   100.0 * double(paint_context_.anticipadas_aciertos) / double(total));
+     }
+diff --git a/sdk/src/ui/window_switch.cpp b/sdk/src/ui/window_switch.cpp
+index 4612c9a..d77917a 100644
+--- a/sdk/src/ui/window_switch.cpp
++++ b/sdk/src/ui/window_switch.cpp
+@@ -195,7 +195,7 @@ static_assert(kBotonA == HidNpadButton_A && kBotonB == HidNpadButton_B &&
+                   kBotonPlus == HidNpadButton_Plus && kBotonMinus == HidNpadButton_Minus &&
+                   kBotonIzquierda == HidNpadButton_Left && kBotonArriba == HidNpadButton_Up &&
+                   kBotonDerecha == HidNpadButton_Right && kBotonAbajo == HidNpadButton_Down,
+-              "switch_imgui_input.h: los bits no coinciden con HidNpadButton de libnx");
++              "switch_imgui_input.h: the bits do not match libnx HidNpadButton");
+ 
+ void LeerEntradaUi(EntradaUi& salida, float toque_a_logico_x, float toque_a_logico_y) {
+   // Only called by ImGuiDrawer::Draw, on the UI thread, so the state can be
+diff --git a/sdk/src/ui/windowed_app_context_switch.cpp b/sdk/src/ui/windowed_app_context_switch.cpp
+index 7755dc3..bf3c470 100644
+--- a/sdk/src/ui/windowed_app_context_switch.cpp
++++ b/sdk/src/ui/windowed_app_context_switch.cpp
+@@ -191,8 +191,8 @@ int SwitchWindowedAppContext::RunMainMessageLoop() {
+         impl_->sobremesa_efectivo = sobremesa;
+       } else if (sobremesa != impl_->sobremesa_efectivo) {
+         impl_->sobremesa_efectivo = sobremesa;
+-        REXLOG_INFO("Switch: Reverse-NX ahora dice {}: se cambia el tamano de la ventana",
+-                    sobremesa ? "sobremesa" : "portatil");
++        REXLOG_INFO("Switch: Reverse-NX now says {}: resizing the window",
++                    sobremesa ? "docked" : "handheld");
+         display_changed_ = true;
+       }
+     }

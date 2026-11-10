@@ -1,0 +1,4 @@
+c15926f Findings: public release 0.311.c41cf75
+Copied from https://github.com/rashevskyv/cvhd-recomp (src/gpu/*, switch/host/include/rex/nx_menu.h, frame_recorder.h)
+at the commit above, 2026-11-09. File headers: "cvhd-recomp, BSD-3 like the SDK" (the repo has no LICENSE file).
+Local changes for LEGO Batman are marked "LEGO Batman port" in the code.

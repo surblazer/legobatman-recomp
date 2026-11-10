@@ -1,0 +1,76 @@
+diff --git a/mesa-imported/codegen/nv50_ir.cpp b/mesa-imported/codegen/nv50_ir.cpp
+index a7adec0..93c97fa 100644
+--- a/mesa-imported/codegen/nv50_ir.cpp
++++ b/mesa-imported/codegen/nv50_ir.cpp
+@@ -590,6 +590,10 @@ void Instruction::init()
+    predSrc = -1;
+    flagsDef = -1;
+    flagsSrc = -1;
++
++   // LEGO Batman port, from SwitchWaker (MIT) patch 6: SchedDataCalculatorGM107::setDelay reads the next block's first
++   // instruction's wait mask before that block is visited; uninitialised, the stall counts depended on heap contents.
++   sched = 0x7e0;
+ }
+ 
+ Instruction::Instruction()
+diff --git a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+index 04717c8..bd86a07 100644
+--- a/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
++++ b/mesa-imported/codegen/nv50_ir_emit_gm107.cpp
+@@ -4119,7 +4119,9 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+    if (delay <= GM107_MIN_ISSUE_DELAY && (wr & rd) != 7) {
+       // Barriers take one additional clock cycle to become active on top of
+       // the clock consumed by the instruction producing it.
+-      if (!next) {
++      // LEGO Batman port, from SwitchWaker patch 8: Mesa's rule restored. The next block's waits are only set when
++      // that block is visited, so a barrier set by a block's last instruction must get stall 2.
++      if (!next || insn->bb != next->bb) {
+          delay = 0x2;
+       } else {
+          int wt = getWtDepBar(next);
+@@ -4128,7 +4130,10 @@ SchedDataCalculatorGM107::setDelay(Instruction *insn, int delay,
+       }
+    }
+ 
+-   if (lastDualIssued || !next || delay > 1 || !targ->canDualIssue(insn, next)) {
++   // LEGO Batman port, from SwitchWaker patch 7: no dual issue (Mesa never dual-issues; uam's experimental pairing
++   // made whole 4x8-pixel fragment warps flicker with wrong lighting on the console).
++   static const bool kDualIssue = false;
++   if (!kDualIssue || lastDualIssued || !next || delay > 1 || !targ->canDualIssue(insn, next)) {
+       delay = CLAMP(delay, GM107_MIN_ISSUE_DELAY, GM107_MAX_ISSUE_DELAY);
+       lastDualIssued = false;
+    } else {
+diff --git a/meson.build b/meson.build
+index 1486cbc..11d658c 100644
+--- a/meson.build
++++ b/meson.build
+@@ -8,9 +8,8 @@ prog_python = import('python3').find_python()
+ has_mako = run_command(
+ 	prog_python, '-c',
+ 	'''
+-from distutils.version import StrictVersion
+ import mako
+-assert StrictVersion(mako.__version__) > StrictVersion("0.8.0")
++assert tuple(int(x) for x in mako.__version__.split(".")[:2]) > (0, 8)
+ 	''')
+ if has_mako.returncode() != 0
+ 	error('Python (3.x) mako module >= 0.8.0 required to build uam.')
+diff --git a/source/compiler_iface.cpp b/source/compiler_iface.cpp
+index 7ce5809..5c2357b 100644
+--- a/source/compiler_iface.cpp
++++ b/source/compiler_iface.cpp
+@@ -1,3 +1,4 @@
++#include <stdlib.h>
+ #include "compiler_iface.h"
+ 
+ namespace
+@@ -258,6 +259,9 @@ DekoCompiler::DekoCompiler(pipeline_stage stage, int optLevel) :
+ 	m_info.bin.sourceRep = PIPE_SHADER_IR_TGSI;
+ 
+ 	m_info.optLevel = optLevel;
++	// LEGO Batman port: UAM_MUL_ZERO_WINS=1 compiles every float MUL/MAD/DP with D3D9 semantics (0 * anything = 0,
++	// Maxwell FMUL/FFMA.FMZ), as TGSI_PROPERTY_MUL_ZERO_WINS does for Gallium Nine. Used for the Xenos shaders.
++	m_info.io.mul_zero_wins = getenv("UAM_MUL_ZERO_WINS") && getenv("UAM_MUL_ZERO_WINS")[0] == '1';
+ 
+ 	m_info.io.auxCBSlot      = 17;            // Driver constbuf c[0x0]. Note that codegen was modified to transform constbuf ids like such: final_id = (raw_id + 1) % 18
+ 	m_info.io.drawInfoBase   = 0x000;         // This is used for gl_BaseVertex, gl_BaseInstance and gl_DrawID (in that order)

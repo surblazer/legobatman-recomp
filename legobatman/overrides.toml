@@ -1,0 +1,68 @@
+# LEGO Batman codegen overrides (included from legobatman_manifest.toml [entrypoint])
+# NOTE: root keys must come before the first [table], or TOML puts them inside it (silently ignored).
+
+# --- Performance: Xbox 360 registers as C++ locals (as in nfsmw-nx docs/toolchain.md) ---
+# Kept in ctx by default; as locals the compiler holds them in host registers and the
+# __savegprlr_*/__restgprlr_* helper calls disappear. Split function pieces that receive live
+# registers need share_registers (see tools/scripts/check_reads_before_writes.py).
+cr_as_local = true
+xer_as_local = true
+ctr_as_local = true
+non_volatile_as_local = true
+
+# mtmsrd (118 sites) would take the runtime's global critical-region lock in game code; on Horizon that lock was
+# heavily contended (profiled 2026-11-09). cvhd-recomp measured ~13k contended locks/s from it and set skip_msr.
+skip_msr = true
+
+# Native setjmp/longjmp: the guest versions save/restore r14-r31/f14-f31/CR, which are host locals now.
+setjmp_address = 0x826BB770    # stores f14-f31, CR, LR, r1, r14-r31, vectors into the buffer at r3 (7 callers)
+longjmp_address = 0x826BB330   # restores that buffer (lfd f14,0(r7) ...)
+
+# Manual function boundaries: code with no .pdata entry that analysis misses.
+[functions]
+# this-adjusting thunk: addi r3,r3,4; b 0x825B49A8 (tail-branched to from 0x825BDFEC)
+"0x825BB280" = { size = 8 }
+
+# Split fragments entered with live registers (no prologue of their own): callers pass registers through ctx.
+# ONLY for real fragments: with non_volatile_as_local the generator drops __savegprlr/__restgprlr everywhere, so a
+# normal function marked share_registers leaks its register values back into its caller (seen as a null-pointer
+# write in sub_82546F48). tools/scripts/check_reads_before_writes.py lists candidates; check each one by hand.
+"0x82708990" = { size = 0x168, share_registers = true }  # .embsec vector routine, inputs in v64/v65 (also in functions_data_refs.toml)
+# Hand-written vector routines with no prologue whose callers preload v69/v72 (non-standard ABI)
+"0x8269EEB0" = { share_registers = true }
+"0x8269F4E8" = { share_registers = true }
+"0x82707238" = { share_registers = true }
+"0x827075E0" = { share_registers = true }
+"0x827078A0" = { share_registers = true }
+"0x82707B08" = { share_registers = true }
+# Hand-written vector routines with no prologue that write non-volatile vector registers (v14-v31, v64+)
+# without saving them: outputs the caller reads back. Under non_volatile_as_local they were lost, which
+# caused visual artifacts in the first story cutscene (bisected 2026-11-08).
+"0x821A8448" = { size = 0xB8, share_registers = true }
+"0x82659168" = { size = 0x190, share_registers = true }
+"0x826592F8" = { share_registers = true }
+"0x82660D00" = { share_registers = true }
+"0x82660EB0" = { share_registers = true }
+"0x82661080" = { share_registers = true }
+"0x82661190" = { share_registers = true }
+"0x826643A0" = { share_registers = true }
+"0x8268B678" = { size = 0x348, share_registers = true }
+"0x8268B9C0" = { size = 0x204, share_registers = true }
+"0x826C1280" = { share_registers = true }
+"0x82707C70" = { share_registers = true }
+"0x82707DB8" = { share_registers = true }
+"0x82707FE0" = { share_registers = true }
+"0x82708240" = { share_registers = true }
+"0x827084E8" = { share_registers = true }
+"0x827086A0" = { share_registers = true }
+"0x827087D8" = { share_registers = true }
+"0x8270D470" = { share_registers = true }
+"0x8270D530" = { share_registers = true }
+"0x8270D918" = { share_registers = true }
+"0x8270DDA0" = { share_registers = true }
+"0x827213E8" = { share_registers = true }
+"0x8272A7E8" = { share_registers = true }
+"0x8272A8C0" = { share_registers = true }
+"0x8272AC08" = { share_registers = true }
+"0x82743008" = { share_registers = true }
+"0x82743118" = { share_registers = true }

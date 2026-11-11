@@ -35,13 +35,13 @@ will not work. Extract the disc (with an ISO extraction tool such as extract-xis
 
 ## Install
 
-There are no releases yet: build it yourself (see Build).
-
-On the SD card:
+1. Download `legobatman-<version>-switch.zip` from [Releases](https://github.com/surblazer/legobatman-recomp/releases)
+   and unzip it to the root of the SD card.
+2. Extract your disc (see Game disc) into `sdmc:/switch/legobatman/game_root/`.
 
 ```
 sdmc:/switch/legobatman/
-    legobatman.nro      the program (out/switch-sd/switch/legobatman/ after a build)
+    legobatman.nro      the program (from the release, or out/switch-sd/switch/legobatman/ after a build)
     game_root/          the extracted Xbox 360 disc: default.xex, GAME.DAT, GAME1.DAT, Audio/, Movies/
 ```
 

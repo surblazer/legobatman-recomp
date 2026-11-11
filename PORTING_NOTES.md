@@ -100,6 +100,12 @@ image. Changes made for this game are marked "LEGO Batman port" in the source.
   is scaled where it reaches a host image (no game shader reads gl_FragCoord). Automatic: one step down while the
   smoothed GPU time is over 31 ms (never below 8/12 = 853x480), one step up when the next step is predicted under
   28 ms, at least 60 frames apart. Scaled images live in their own pool, which is reset at every change.
+- **Small DXT textures** (64x64 or less: HUD hearts, icons) are decoded to RGBA8 on the CPU. Uploaded compressed,
+  the 32x32 DXT5 hearts showed only their left half on the console, although the guest data and our untiling decode
+  to a whole heart on the PC and the quad samples the whole texture; depth clamp, no depth test and a fresh upload
+  every frame changed nothing. The loss is in the GPU-side copy into a small block-compressed image (2026-11-11).
+  Debug flag 21 turns the CPU decode off.
+- **Clip disable:** PA_CL_CLIP_CNTL.CLIP_DISABLE turns on depth clamp, as in the SDK's Vulkan path.
 - **Render target compression** (DkImageFlags_HwCompression): clears 3.0 to 0.64 ms per frame.
 - **Resolves:** repeated resolves of the same picture (the final picture went to the front buffer 4 times per frame)
   are skipped, and back-to-back resolve barriers are merged: 6.6 to 5.3 ms per frame.
@@ -172,10 +178,11 @@ looks them up by FNV-1a 64 of the big-endian microcode. `tools/switch-env/stage-
 - **Debug server** (`legobatman/switch/host/debug_server.cpp`, port 6543, no password: local network only). Client:
   `tools/switch-env/lbdbg.py`, console address in `tools/switch-env/switch_host.txt`. Commands:
   - `ping`, `info`, `log` (a 2 MB ring of stdout, then live);
-  - `shot` (the next front buffer), `draws` (the next frame's draw list);
+  - `shot` (the next front buffer), `draws` (the next frame's draw list, with each draw's texture fetch constants and first vertices);
   - `skip <PS>` / `unskip`;
   - `press` / `hold` / `release` / `stick` / `trigger`;
   - `get` / `put` / `ls` / `rm` (paths relative to the NRO's folder);
+  - `mem <address> <bytes>` (guest physical memory, to decode a texture or buffer on the PC);
   - `flag N V`, the renderer's debug flags:
 
   | Flag | Effect |
@@ -197,6 +204,10 @@ looks them up by FNV-1a 64 of the big-endian microcode. `tools/switch-env/stage-
   | 15 | Clamp the game's float constants |
   | 16 | Clamp diagnostic |
   | 17 N | Render scale: 0 = automatic, 6..12 = fixed twelfths |
+  | 18 | Depth clamp on every draw |
+  | 19 | No depth test |
+  | 20 | Re-upload every texture every frame |
+  | 21 | Upload small DXT textures compressed (no CPU decode) |
 
 - **Deploy:** `tools/switch-env/nx-run.sh` sends the NRO to hbmenu's netloader (press Y in hbmenu). The netloader
   writes under `sdmc:/switch/` and strips leading slashes.

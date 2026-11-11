@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <functional>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -78,7 +79,16 @@ std::atomic<int> flags[32];  // "flag N V": 0 = re-upload linear/dynamic texture
 std::atomic<int> want_draws{0};  // 1 = collect the next frame, 2 = collecting
 std::vector<std::string> draws;
 bool draws_ready = false;
+// "mem <address> <bytes>": guest physical memory, for the PC to decode (set when the backend starts).
+std::function<const uint8_t*(uint32_t)> translate;
 }  // namespace lbshot
+bool lb_dbg_mem(uint32_t address, uint32_t bytes, std::string* out) {
+  if (!lbshot::translate || bytes > (4u << 20) || uint64_t(address) + bytes > 0x20000000ull) return false;
+  const uint8_t* p = lbshot::translate(address);
+  if (!p) return false;
+  out->assign(reinterpret_cast<const char*>(p), bytes);
+  return true;
+}
 void lb_dbg_skip(uint64_t ps, bool on) {
   for (auto& slot : lbshot::skip_ps) {
     uint64_t cur = slot.load();
@@ -264,6 +274,73 @@ struct HostImage {
   uint32_t guest_base = 0;    // textures and resolve destinations
   uint32_t edram_base = 0, edram_pitch = 0;  // render targets
 };
+
+// LEGO Batman port: small DXT1/3/5 textures are decoded to RGBA8 on the CPU. The HUD hearts (32x32 DXT5) showed only
+// their left half on the console although the guest data and our untiling give the whole heart (decoded on the PC,
+// 2026-11-11): the copy into a small block-compressed image loses the right half on the GPU side. A 64x64 texture is
+// 4,096 texels to decode, nothing next to a frame.
+constexpr uint32_t kDecodeDxtMax = 64;
+inline void DxtColors(const uint8_t* b, uint8_t (*c)[4], bool dxt1) {
+  const uint16_t c0 = uint16_t(b[0] | b[1] << 8), c1 = uint16_t(b[2] | b[3] << 8);
+  auto rgb = [](uint16_t v, uint8_t* o) {
+    o[0] = uint8_t(((v >> 11) & 31) * 255 / 31);
+    o[1] = uint8_t(((v >> 5) & 63) * 255 / 63);
+    o[2] = uint8_t((v & 31) * 255 / 31);
+    o[3] = 255;
+  };
+  rgb(c0, c[0]);
+  rgb(c1, c[1]);
+  if (!dxt1 || c0 > c1) {
+    for (int k = 0; k < 3; k++) {
+      c[2][k] = uint8_t((2 * c[0][k] + c[1][k]) / 3);
+      c[3][k] = uint8_t((c[0][k] + 2 * c[1][k]) / 3);
+    }
+    c[2][3] = c[3][3] = 255;
+  } else {
+    for (int k = 0; k < 3; k++) {
+      c[2][k] = uint8_t((c[0][k] + c[1][k]) / 2);
+      c[3][k] = 0;
+    }
+    c[2][3] = 255;
+    c[3][3] = 0;
+  }
+}
+// blocks: bw x bh host-order BC blocks (bpb 8 = DXT1, 16 = DXT2/3 or DXT4/5 by `dxt3`); out: RGBA8, width x height.
+inline void DecodeDxt(const uint8_t* blocks, uint32_t bw, uint32_t bh, uint32_t bpb, bool dxt3, uint8_t* out, uint32_t width,
+                      uint32_t height) {
+  for (uint32_t by = 0; by < bh; by++) {
+    for (uint32_t bx = 0; bx < bw; bx++) {
+      const uint8_t* b = blocks + (size_t(by) * bw + bx) * bpb;
+      const uint8_t* cb = bpb == 16 ? b + 8 : b;
+      uint8_t c[4][4];
+      DxtColors(cb, c, bpb == 8);
+      const uint32_t bits = uint32_t(cb[4] | cb[5] << 8 | cb[6] << 16 | uint32_t(cb[7]) << 24);
+      uint8_t al[8] = {};
+      uint64_t abits = 0;
+      if (bpb == 16 && !dxt3) {
+        al[0] = b[0];
+        al[1] = b[1];
+        if (al[0] > al[1]) {
+          for (int i = 0; i < 6; i++) al[2 + i] = uint8_t(((6 - i) * al[0] + (i + 1) * al[1]) / 7);
+        } else {
+          for (int i = 0; i < 4; i++) al[2 + i] = uint8_t(((4 - i) * al[0] + (i + 1) * al[1]) / 5);
+          al[6] = 0;
+          al[7] = 255;
+        }
+        for (int i = 0; i < 6; i++) abits |= uint64_t(b[2 + i]) << (8 * i);
+      }
+      for (uint32_t i = 0; i < 16; i++) {
+        const uint32_t x = bx * 4 + i % 4, y = by * 4 + i / 4;
+        if (x >= width || y >= height) continue;
+        uint8_t* o = out + (size_t(y) * width + x) * 4;
+        std::memcpy(o, c[(bits >> (2 * i)) & 3], 4);
+        if (bpb == 16) {
+          o[3] = dxt3 ? uint8_t(((b[i / 2] >> (4 * (i & 1))) & 15) * 17) : al[(abits >> (3 * i)) & 7];
+        }
+      }
+    }
+  }
+}
 
 class DkShaderObj : public Shader {
  public:
@@ -542,6 +619,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
   bool SetupContext() override {
 #ifndef LEGOBATMAN_HASH_TEXTURES
     watch_handle_ = memory_->RegisterPhysicalMemoryInvalidationCallback(&WatchInvalidated, this);
+#endif
+#ifndef CVHD_DK_GL
+    lbshot::translate = [mem = memory_](uint32_t a) { return reinterpret_cast<const uint8_t*>(mem->TranslatePhysical(a)); };
 #endif
     DkDeviceMaker dm;
     dkDeviceMakerDefaults(&dm);
@@ -895,11 +975,11 @@ class Deko3dCommandProcessor : public CommandProcessor {
       // Each shader pair's first draw, once: the state a new kind of draw comes with.
       auto blend = regs.Get<reg::RB_BLENDCONTROL>();
       {
-        Log("draw VS %016llX PS %016llX: prim %u n=%u%s, blend %u/%u op %u, mask %x, z %u/%u func %u, cull f%u b%u face %u, %zu vfetch %zu tfetch",
+        Log("draw VS %016llX PS %016llX: prim %u n=%u%s, blend %u/%u op %u, mask %x, z %u/%u func %u, cull f%u b%u face %u, clip off %u, %zu vfetch %zu tfetch",
                 (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(), uint32_t(prim_type), index_count,
                 index_buffer_info ? " indexed" : "", uint32_t(blend.color_srcblend), uint32_t(blend.color_destblend),
                 uint32_t(blend.color_comb_fcn), regs.values[XE_GPU_REG_RB_COLOR_MASK] & 0xF, dc.z_enable, dc.z_write_enable,
-                uint32_t(dc.zfunc), regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_front, regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_back, regs.Get<reg::PA_SU_SC_MODE_CNTL>().face, vs->vertex_bindings().size(), ps->texture_bindings().size());
+                uint32_t(dc.zfunc), regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_front, regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_back, regs.Get<reg::PA_SU_SC_MODE_CNTL>().face, uint32_t(regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable), vs->vertex_bindings().size(), ps->texture_bindings().size());
         // Its vertex layout and the first vertices (byte-swapped words as hex and as floats).
         for (const auto& vb : vs->vertex_bindings()) {
           auto fetch = regs.GetVertexFetch(vb.fetch_constant);
@@ -1141,6 +1221,13 @@ class Deko3dCommandProcessor : public CommandProcessor {
       rs.frontFace = front_cw ? DkFrontFace_CW : DkFrontFace_CCW;
     }
     rs.fillRectangleEnable = rects && !use_gs;
+    // LEGO Batman port: CLIP_DISABLE = no near/far clipping on the Xenos; depth is clamped instead (the SDK's Vulkan
+    // path does the same). The HUD hearts are small 3D objects that turn in front of the camera: clipped at the near
+    // plane, their nearer half vanished (console, 2026-11-11).
+    rs.depthClampEnable = regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+#ifndef CVHD_DK_GL
+    if (lbshot::flags[18]) rs.depthClampEnable = 1;  // debug: depth clamp on every draw
+#endif
     // LEGO Batman port: depth bias (polygon offset), converted as the SDK's Vulkan path does. Without it the game's
     // decals and overlays drawn on top of coplanar surfaces z-fought: flicker on the console's GPU.
     {
@@ -1177,6 +1264,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
     DkDepthStencilState ds;
     dkDepthStencilStateDefaults(&ds);
     ds.depthTestEnable = depth && dc.z_enable;
+#ifndef CVHD_DK_GL
+    if (lbshot::flags[19]) ds.depthTestEnable = 0;  // debug: no depth test
+#endif
     ds.depthWriteEnable = depth && dc.z_write_enable;
     ds.depthCompareOp = CompareOp(dc.zfunc);
     // LEGO Batman port: stencil (was always off). Xenos stencil ops and compare functions are deko3d's minus one.
@@ -1397,8 +1487,30 @@ class Deko3dCommandProcessor : public CommandProcessor {
       std::snprintf(d, sizeof(d), "#%u VS %016llX PS %016llX prim %u n=%u", frame_draws_ - 1,
                     (unsigned long long)vs->ucode_data_hash(), (unsigned long long)ps->ucode_data_hash(), uint32_t(prim_type),
                     index_count);
+      std::string line = d;
+      // The pixel shader's texture fetch constants (6 dwords each) and the first vertex buffer's first 24 dwords
+      // (big-endian words as the guest stores them), for the PC to decode a draw.
+      for (const auto& tb : ps->texture_bindings()) {
+        const uint32_t* fc = &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + tb.fetch_constant * 6];
+        char t[96];
+        std::snprintf(t, sizeof(t), " | tf%u %08X %08X %08X %08X %08X %08X", tb.fetch_constant, fc[0], fc[1], fc[2], fc[3],
+                      fc[4], fc[5]);
+        line += t;
+      }
+      if (!vs->vertex_bindings().empty()) {
+        const auto& vb = vs->vertex_bindings().front();
+        auto vf = regs.GetVertexFetch(vb.fetch_constant);
+        char t[64];
+        std::snprintf(t, sizeof(t), " | vb %08X stride %u endian %u:", vf.address << 2, vb.stride_words, uint32_t(vf.endian));
+        line += t;
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(vf.address << 2));
+        for (uint32_t i = 0; i < 24 && i < vf.size; i++) {
+          std::snprintf(t, sizeof(t), " %08X", w[i]);
+          line += t;
+        }
+      }
       std::lock_guard<std::mutex> lk(lbshot::lock);
-      lbshot::draws.push_back(d);
+      lbshot::draws.push_back(line);
     }
 #endif
     phase(6);
@@ -2548,6 +2660,7 @@ class Deko3dCommandProcessor : public CommandProcessor {
     // TextureInfo keeps the fetch constant's fields: the size minus one.
     if (info.width + 1 >= 4000) frame_big_tex_ = true;
     const TexSource src = SourceOf(info);
+    if (DecodeOnCpu(format, src)) format = DkImageFormat_RGBA8_Unorm;
     if (src.level) frame_mip_only_ = true;
     const uint32_t base = src.address;
     HostImage* img = GuestImage(f, base, src.width, src.height, format, false);
@@ -2561,7 +2674,11 @@ class Deko3dCommandProcessor : public CommandProcessor {
     img->checked_frame = swaps_;
 #endif
     // Never filled, or written by the guest (or a file read) after the upload / resolve that filled it.
-    if (img->content_serial && !MemoryChanged(*img, base, src.bytes)) return img;
+    if (img->content_serial && !MemoryChanged(*img, base, src.bytes)
+#ifndef CVHD_DK_GL
+        && !lbshot::flags[20]  // debug: re-upload every texture every frame
+#endif
+    ) return img;
     // LEGO Batman port: CPU-written (linear) images and ones that changed before (the intro movie's YUV planes: the
     // decoder rewrites only some macroblocks, which the sampled hash missed) are hashed in full. The hash is taken
     // BEFORE the copy: a decoder still writing during the copy then leaves memory that differs from the hash, so the
@@ -2673,6 +2790,15 @@ class Deko3dCommandProcessor : public CommandProcessor {
     return s;
   }
 
+  // LEGO Batman port: see kDecodeDxtMax.
+  static bool DecodeOnCpu(DkImageFormat format, const TexSource& s) {
+#ifndef CVHD_DK_GL
+    if (lbshot::flags[21]) return false;  // debug: upload small DXT textures compressed, as before
+#endif
+    return (format == DkImageFormat_RGBA_BC1 || format == DkImageFormat_RGBA_BC2 || format == DkImageFormat_RGBA_BC3) &&
+           s.width <= kDecodeDxtMax && s.height <= kDecodeDxtMax;
+  }
+
   bool UploadTexture(Frame& f, HostImage& img, const TextureInfo& info, const TexSource& s, xenos::Endian endian) {
     FlushResolveBarrier(f.cmdbuf);
     GpuScope gs(this, f, kTagUpload);
@@ -2682,6 +2808,8 @@ class Deko3dCommandProcessor : public CommandProcessor {
     uint32_t bh = (height + fi->block_height - 1) / fi->block_height;
     uint32_t bpb = fi->bytes_per_block();
     uint32_t bytes = bw * bh * bpb;
+    const bool decode = img.format == DkImageFormat_RGBA8_Unorm && fi->block_width == 4 && (bpb == 8 || bpb == 16);
+    if (decode) bytes = std::max(bytes, width * height * 4);  // the blocks first, then RGBA8 over them
     uint32_t off = f.staging.Alloc(bytes, 0x100);
     if (off == UINT32_MAX) {
       static uint32_t full_logged = 0;
@@ -2701,6 +2829,10 @@ class Deko3dCommandProcessor : public CommandProcessor {
       uint32_t src_row = s.pitch_blocks * bpb;
       src += s.oy * src_row + s.ox * bpb;
       for (uint32_t y = 0; y < bh; y++) texture_conversion::CopySwapBlock(endian, dst + y * row, src + y * src_row, row);
+    }
+    if (decode) {
+      std::vector<uint8_t> blocks(dst, dst + size_t(bw) * bh * bpb);
+      DecodeDxt(blocks.data(), bw, bh, bpb, info.format == xenos::TextureFormat::k_DXT2_3, dst, width, height);
     }
     DkCopyBuf cb{f.staging.gpu + off, 0, 0};
     DkImageView view;

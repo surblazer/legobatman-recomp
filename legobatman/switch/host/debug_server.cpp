@@ -38,6 +38,7 @@ extern volatile unsigned rex_nx_swaps;
 // Screenshot, served by the deko3d backend at its next swap (src/gpu/deko3d_backend.cpp).
 bool lb_dbg_shot(std::vector<uint8_t>* rgba, uint32_t* w, uint32_t* h, int timeout_ms);
 void lb_dbg_skip(uint64_t ps, bool on);
+bool lb_dbg_mem(uint32_t address, uint32_t bytes, std::string* out);
 void lb_dbg_flag(int n, int v);
 bool lb_dbg_draws(std::vector<std::string>* out, int timeout_ms);
 
@@ -194,6 +195,14 @@ void Client(int fd) {
     } else if (cmd == "flag" && a.size() >= 3) {
       lb_dbg_flag(std::atoi(a[1].c_str()), std::atoi(a[2].c_str()));
       if (!Reply(fd, true, "")) break;
+    } else if (cmd == "mem" && a.size() >= 3) {
+      // mem <physical address hex> <bytes>: raw guest memory (at most 4 MB).
+      std::string body;
+      if (!lb_dbg_mem(uint32_t(std::strtoul(a[1].c_str(), nullptr, 16)), uint32_t(std::strtoul(a[2].c_str(), nullptr, 0)), &body)) {
+        if (!Reply(fd, false, "bad range")) break;
+        continue;
+      }
+      if (!Reply(fd, true, body)) break;
     } else if (cmd == "draws") {
       std::vector<std::string> list;
       if (!lb_dbg_draws(&list, 5000)) { if (!Reply(fd, false, "no frame within 5 s")) break; continue; }

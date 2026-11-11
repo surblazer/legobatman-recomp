@@ -9,6 +9,7 @@
     lbdbg.py stick L|R X Y                         -1..1, y up; "stick L 0 0" lets go
     lbdbg.py trigger L|R V                         0..1
     lbdbg.py draws | skip PS_HASH | unskip [PS_HASH]   next frame's draw list; skip a pixel shader's draws
+    lbdbg.py mem ADDR_HEX BYTES OUT                guest physical memory to a file
     lbdbg.py get REMOTE [LOCAL] | put LOCAL REMOTE | ls [PATH] | rm PATH
 Paths are relative to sdmc:/switch/legobatman/ unless they start with '/'.
 The console's address: env LB_HOST, or the first line of tools/switch-env/switch_host.txt.
@@ -133,6 +134,12 @@ def main():
         print(body.decode())
         if not ok:
             sys.exit(1)
+    elif cmd == 'mem':
+        ok, body = command('mem %s %s' % (a[1], a[2]), timeout=60)
+        if not ok:
+            sys.exit(body.decode(errors='replace'))
+        Path(a[3]).write_bytes(body)
+        print(len(body), 'bytes')
     elif cmd in ('skip', 'unskip', 'draws', 'flag'):
         ok, body = command(' '.join(a), timeout=15)
         sys.stdout.write(body.decode(errors='replace'))

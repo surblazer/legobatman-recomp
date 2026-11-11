@@ -117,12 +117,14 @@ if(REXGLUE_PLATFORM_SWITCH)
             COMMENT "Packaging legobatman.nro with the shaders in romfs"
             VERBATIM)
     endif()
-    # A ready-to-copy SD card layout: out/switch-sd/switch/legobatman/legobatman.nro (the game data goes in game_root/
+    # A ready-to-copy SD card layout: out/switch-sd/switch/legobatman/legobatman.nro + legobatman.toml (the release
+    # zip's contents; the game data goes in game_root/
     # next to it on the card). Runs after the packaging steps above, so it copies the final NRO.
     set(LEGOBATMAN_SD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out/switch-sd/switch/legobatman")
     add_custom_command(TARGET legobatman POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${LEGOBATMAN_SD_DIR}"
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE_DIR:legobatman>/legobatman.nro" "${LEGOBATMAN_SD_DIR}/legobatman.nro"
-        COMMENT "Copying legobatman.nro to out/switch-sd/switch/legobatman/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/sd/legobatman.toml" "${LEGOBATMAN_SD_DIR}/legobatman.toml"
+        COMMENT "Copying legobatman.nro and legobatman.toml (sd/) to out/switch-sd/switch/legobatman/"
         VERBATIM)
 endif()

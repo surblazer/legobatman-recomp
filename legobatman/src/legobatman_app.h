@@ -35,7 +35,13 @@ extern "C" void lb_dbg_start(const char* root, int port);  // switch/host/debug_
 REXCVAR_DEFINE_BOOL(logging, false, "Logging", "Write log files to the SD card (Switch; default on in development builds)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
-REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU", "Backend inside the GPU plugin: any, vulkan, trace, deko3d")
+// The Switch defaults to deko3d: the SDK's Xenos emulation over Vulkan (NVK) runs at about 2 fps there.
+#if REX_PLATFORM_SWITCH
+#define LEGOBATMAN_DEFAULT_GPU_BACKEND "deko3d"
+#else
+#define LEGOBATMAN_DEFAULT_GPU_BACKEND "any"
+#endif
+REXCVAR_DEFINE_STRING(gpu_backend, LEGOBATMAN_DEFAULT_GPU_BACKEND, "GPU", "Backend inside the GPU plugin: any, vulkan, trace, deko3d")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 class LegobatmanApp : public rex::ReXApp {

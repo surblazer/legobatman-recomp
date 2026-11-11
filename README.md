@@ -42,15 +42,16 @@ will not work. Extract the disc (with an ISO extraction tool such as extract-xis
 ```
 sdmc:/switch/legobatman/
     legobatman.nro      the program (from the release, or out/switch-sd/switch/legobatman/ after a build)
+    legobatman.toml     settings (in the release; legobatman/sd/legobatman.toml in the repository)
     game_root/          the extracted Xbox 360 disc: default.xex, GAME.DAT, GAME1.DAT, Audio/, Movies/
 ```
 
 The game creates `userdata/` (saves) and an empty `logs/` next to them. Start it from hbmenu (title takeover
 recommended: hold R while starting a game, for the full memory).
 
-Log files are off. To turn them on (for a bug report), add `logging = true` at the top of
-`sdmc:/switch/legobatman/legobatman.toml` (next to the NRO; create the file if it is not there) and restart the
-game: the logs go to `logs/` and `logs/rex/`. A crash writes `logs/rex/rex_crash.log` either way.
+Settings are in `legobatman.toml` next to the NRO (each one is explained in the file); restart the game after a
+change. Log files are off: to turn them on (for a bug report), set `logging = true`. The logs go to `logs/` and
+`logs/rex/`. A crash writes `logs/rex/rex_crash.log` either way.
 
 ## Controls
 
@@ -58,14 +59,13 @@ The game's on-screen prompts show Xbox 360 buttons. By default the face buttons 
 games: Switch A is Xbox A (confirm, jump), B is B, X is X, Y is Y.
 
 To use them **by position** instead, as on an Xbox pad (the bottom button is A: Switch B acts as A, A as B, Y as X and
-X as Y), add this line at the top of `sdmc:/switch/legobatman/legobatman.toml` (next to the NRO; create the file if
-it is not there; above any `[section]` line) and restart the game:
+X as Y), set this in `sdmc:/switch/legobatman/legobatman.toml` and restart the game:
 
 ```toml
 input_xbox_layout = true
 ```
 
-`false`, or no line, is the default layout. + is Start and − is Back on both.
+`false` is the default layout. + is Start and − is Back on both.
 
 ## Performance
 

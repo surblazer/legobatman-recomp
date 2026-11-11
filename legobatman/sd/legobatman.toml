@@ -1,0 +1,13 @@
+# LEGO Batman: The Videogame (Xbox 360) on Switch: settings.
+# Keep this file next to legobatman.nro. Top-level keys only (above any [section] line). Restart the game after a change.
+
+# Renderer. "deko3d" = the native Switch renderer (default). "any" = the SDK's Xbox 360 GPU emulation over Vulkan,
+# for comparison only: about 2 fps.
+gpu_backend = "deko3d"
+
+# Face buttons. false = by letter, as in other Switch games (Switch A is Xbox A). true = by position, as on an Xbox
+# pad (Switch B acts as A, A as B, Y as X, X as Y). + is Start and - is Back either way.
+input_xbox_layout = false
+
+# Log files in logs/ next to the NRO, for bug reports. A crash writes logs/rex/rex_crash.log either way.
+logging = false

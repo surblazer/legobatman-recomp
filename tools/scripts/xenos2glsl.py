@@ -224,6 +224,13 @@ class Translator:
         if op == 'vfetch_full':
             self.cur_slot = slot
             self.stride_words = int(kv.get('Stride', '0'))
+        # LEGO Batman port: a fetch that writes only constants ('r8.000_': D3D's stand-in for an element the mesh does
+        # not have) reads nothing. The SDK leaves it out of the shader's vertex bindings (GatherVertexFetchInformation:
+        # no used result components), so it must not take an input either: in_<n> would shift by one and the position
+        # would read the colour (the stud sprites were invisible, console 2026-11-18).
+        if not GENERIC_FETCH and all(ch is None or ch in '01' for ch in comps):
+            self.body.extend(self.write_masked(target, comps, 'vec4(0.0)', False))
+            return
         attr = {
             'index': len(self.attrs),
             'slot': self.cur_slot,

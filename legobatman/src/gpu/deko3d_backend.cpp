@@ -1065,7 +1065,12 @@ class Deko3dCommandProcessor : public CommandProcessor {
           continue;
         }
       }
-      HostImage* tex = cube_fallback ? PlaceholderTexture(false) : TextureImage(f, info, fetch);
+#ifndef CVHD_DK_GL
+      const bool cube_white = lbshot::flags[22] != 0;  // debug: white instead of black for cube maps
+#else
+      const bool cube_white = false;
+#endif
+      HostImage* tex = cube_fallback ? PlaceholderTexture(cube_white) : TextureImage(f, info, fetch);
       if (!tex) { textures_ok = false; continue; }  // e.g. the staging ring is full this frame: draw next frame
       // Only while the picture is still being resolved tile by tile: the frame's later full-screen passes read the
       // completed image and are drawn once.
@@ -1221,6 +1226,9 @@ class Deko3dCommandProcessor : public CommandProcessor {
       rs.frontFace = front_cw ? DkFrontFace_CW : DkFrontFace_CCW;
     }
     rs.fillRectangleEnable = rects && !use_gs;
+#ifndef CVHD_DK_GL
+    if (lbshot::flags[23]) rs.cullMode = DkFace_None;  // debug: no face culling
+#endif
     // LEGO Batman port: CLIP_DISABLE = no near/far clipping on the Xenos; depth is clamped instead (the SDK's Vulkan
     // path does the same). The HUD hearts are small 3D objects that turn in front of the camera: clipped at the near
     // plane, their nearer half vanished (console, 2026-11-11).
@@ -1406,8 +1414,29 @@ class Deko3dCommandProcessor : public CommandProcessor {
                             index_addr);
       dkCmdBufDrawIndexed(cmd, prim, index_count, DrawInstances(), 0, 0, 0);
     } else {
+#ifndef CVHD_DK_GL
+      // debug flag 24: a non-indexed quad list drawn as triangles (0 1 2, 0 2 3 per quad) instead of hardware quads.
+      if (lbshot::flags[24] && prim_type == xenos::PrimitiveType::kQuadList && index_count >= 4 && index_count <= 65536) {
+        const uint32_t quads = index_count / 4;
+        const uint32_t off = f.data.Alloc(quads * 6 * 2, 4);
+        if (off != UINT32_MAX) {
+          uint16_t* ix = reinterpret_cast<uint16_t*>(f.data.cpu + off);
+          for (uint32_t q = 0; q < quads; q++) {
+            const uint16_t b = uint16_t(q * 4);
+            ix[q * 6 + 0] = b; ix[q * 6 + 1] = uint16_t(b + 1); ix[q * 6 + 2] = uint16_t(b + 2);
+            ix[q * 6 + 3] = b; ix[q * 6 + 4] = uint16_t(b + 2); ix[q * 6 + 5] = uint16_t(b + 3);
+          }
+          dkCmdBufBindIdxBuffer(cmd, DkIdxFormat_Uint16, f.data.gpu + off);
+          dkCmdBufDrawIndexed(cmd, DkPrimitive_Triangles, quads * 6, DrawInstances(), 0, 0, 0);
+          goto drawn;
+        }
+      }
+#endif
       dkCmdBufDraw(cmd, prim, index_count, DrawInstances(), 0, 0);
     }
+#ifndef CVHD_DK_GL
+  drawn:
+#endif
     if (trace_enabled_ && !traced_) {
       // One line per draw of a gameplay frame (file sdmc:/switch/cvhd/dk_trace): what the HP/MP bar and the
       // scaled sprites are drawn with.

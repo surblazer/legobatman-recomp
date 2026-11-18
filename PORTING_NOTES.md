@@ -124,6 +124,9 @@ looks them up by FNV-1a 64 of the big-endian microcode. `tools/switch-env/stage-
   the Switch GPU: purple and green flicker in the intro, the menu and gameplay. llvmpipe on the PC hid it.
   The exact form is `p = a*b; isnan(p) ? 0 : p`. A taint analysis keeps plain multiplies where no operand can be
   Inf/NaN; `XENOS_EXACT_MULS=1` (the shipped set) makes every multiply exact.
+- **Constant-only vertex fetches** (`vfetch_full r8.000_`: D3D's stand-in for an element the mesh lacks) take no
+  input. The SDK leaves them out of the vertex bindings (no used result components), so an input for them shifted
+  every later one and the position read the colour: the in-world stud sprites were invisible (2026-11-18).
 - **Additions to the translator:** the address register (`maxas`, `c[N+a0]`: skinning), `setTexLOD`, the `cube` op,
   vertex texture fetches, unnormalized (texel) fetches, and results written to a register the stage lacks (dropped,
   as the hardware does).
@@ -208,6 +211,9 @@ looks them up by FNV-1a 64 of the big-endian microcode. `tools/switch-env/stage-
   | 19 | No depth test |
   | 20 | Re-upload every texture every frame |
   | 21 | Upload small DXT textures compressed (no CPU decode) |
+  | 22 | White instead of black placeholder for cube maps |
+  | 23 | No face culling |
+  | 24 | Non-indexed quad lists drawn as triangles |
 
 - **Deploy:** `tools/switch-env/nx-run.sh` sends the NRO to hbmenu's netloader (press Y in hbmenu). The netloader
   writes under `sdmc:/switch/` and strips leading slashes.
